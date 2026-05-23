@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# local data
+*.sqlite
+*.db
+data/
+
+# loose script outputs
+*.csv
+
+# Node / web build artifacts
+node_modules/
+web/dist/
+
+# editor
+.idea/
+.vscode/

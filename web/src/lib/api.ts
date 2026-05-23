@@ -1,0 +1,154 @@
+/** Thin typed client for the Metahunter API. */
+
+export type Me = {
+  user: string | null
+  window_days: number | null
+  total_matches: number
+  decided_matches: number
+  match_wins: number
+  match_losses: number
+  match_winrate: number | null
+  game_wins: number
+  game_losses: number
+  game_winrate: number | null
+  play_wins: number
+  play_losses: number
+  play_winrate: number | null
+  draw_wins: number
+  draw_losses: number
+  draw_winrate: number | null
+  first_match_at: number | null
+  last_match_at: number | null
+}
+
+export type DeckRow = {
+  archetype: string
+  wins: number
+  losses: number
+  total: number
+  winrate: number | null
+}
+
+export type MatchRow = {
+  match_id: string
+  log_mtime: number
+  opponent: string
+  your_deck: string
+  their_deck: string
+  match_winner: string | null
+  result: "W" | "L" | "?"
+  your_games: number
+  their_games: number
+  turns: number
+  /** True if you were on the play in game 1, false if on the draw,
+   *  null when the parser couldn't determine who chose to play first. */
+  on_play: boolean | null
+}
+
+export type MatchesPage = {
+  total: number
+  page: number
+  page_size: number
+  items: MatchRow[]
+}
+
+export type MatchupRow = {
+  your_deck: string
+  their_deck: string
+  wins: number
+  losses: number
+  total: number
+  winrate: number | null
+}
+
+export type MatchDetail = {
+  match_id: string
+  log_path: string
+  log_mtime: number
+  players: string[]
+  first_player: string | null
+  turns: number
+  match_winner: string | null
+  score: [number, number] | null
+  games: { winner: string | null; loser: string | null; by_concede: boolean }[]
+  archetypes: Record<string, string>
+  signatures: Record<string, { name: string; count: number }[]>
+  cards_by_player: Record<string, string[]>
+  user: string | null
+}
+
+export type MatchLog = {
+  match_id: string
+  log_path: string
+  size_bytes: number
+  truncated: boolean
+  text: string
+}
+
+async function get<T>(url: string): Promise<T> {
+  const r = await fetch(url)
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText} on ${url}`)
+  return r.json() as Promise<T>
+}
+
+const qs = (params: Record<string, string | number | undefined | null>) => {
+  const sp = new URLSearchParams()
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== "") sp.set(k, String(v))
+  }
+  const s = sp.toString()
+  return s ? `?${s}` : ""
+}
+
+export type TimelineRow = {
+  date: string         // YYYY-MM-DD
+  ts: number           // epoch seconds at UTC midnight
+  matches: number
+  wins: number
+  losses: number
+  winrate: number | null
+}
+
+export type RangeParams = {
+  days?: number
+  from?: number   // epoch seconds (inclusive lower bound)
+  to?: number     // epoch seconds (inclusive upper bound)
+  /** MTGO format scope ("Legacy" / "Vintage" / "Modern" / …). The
+   *  backend defaults to Legacy when this is omitted. */
+  format?: string
+  /** MTGO account scope. Empty / omitted means "let the backend pick
+   *  the primary account on this machine". */
+  user?: string
+}
+
+export type FormatCounts = Record<string, number>
+
+export type Account = {
+  user: string
+  matches: number
+  last_played: number
+}
+
+export const api = {
+  health: () => get<{ ok: boolean; corpus_decks: number; archetypes: number }>("/api/health"),
+  formats: (r: { user?: string } = {}) => get<FormatCounts>(`/api/formats${qs(r)}`),
+  accounts: () => get<Account[]>("/api/accounts"),
+  me: (r: RangeParams = {}) => get<Me>(`/api/me${qs(r)}`),
+  decks: (r: RangeParams = {}) => get<DeckRow[]>(`/api/decks${qs(r)}`),
+  opponents: (r: RangeParams = {}) => get<DeckRow[]>(`/api/opponents${qs(r)}`),
+  timeline: (r: RangeParams = {}) => get<TimelineRow[]>(`/api/timeline${qs(r)}`),
+  matches: (
+    params: RangeParams & {
+      your_deck?: string
+      their_deck?: string
+      opponent?: string
+      result?: "W" | "L"
+      page?: number
+      page_size?: number
+    }
+  ) => get<MatchesPage>(`/api/matches${qs(params)}`),
+  matchups: (r: RangeParams & { your_deck?: string } = {}) =>
+    get<MatchupRow[]>(`/api/matchups${qs(r)}`),
+  match: (id: string) => get<MatchDetail>(`/api/match/${id}`),
+  matchLog: (id: string) => get<MatchLog>(`/api/match/${id}/log`),
+}
