@@ -60,7 +60,15 @@ hiddenimports = [
 
 a = Analysis(
     ["scripts/serve.py"],
-    pathex=[str(ROOT), str(ROOT / "src")],
+    # The metahunter_core package is vendored at
+    # packages/metahunter-core/src/. It's a separate package from
+    # mtgo_meta and lives outside the default src/ path, so we add
+    # its src/ directory explicitly here.
+    pathex=[
+        str(ROOT),
+        str(ROOT / "src"),
+        str(ROOT / "packages" / "metahunter-core" / "src"),
+    ],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,

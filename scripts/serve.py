@@ -37,7 +37,7 @@ from watchdog.observers import Observer
 from mtgo_meta.api.app import create_app
 from mtgo_meta.config import find_mtgo_appfiles_dirs
 from mtgo_meta.ingest import ingest_all
-from mtgo_meta.parser import parse_game_log
+from metahunter_core.parser import parse_game_log
 from mtgo_meta.paths import default_db_path, is_frozen, user_data_dir, web_dist_dir
 from mtgo_meta.store import MatchStore
 

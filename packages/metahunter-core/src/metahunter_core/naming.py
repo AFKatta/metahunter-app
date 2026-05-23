@@ -14,7 +14,7 @@ in the sideboard (signaling a +20-card variant).
 
 from __future__ import annotations
 
-from mtgo_meta.colors import combo_name
+from metahunter_core.colors import combo_name
 
 
 # Bare-name overrides applied before color prefixing. Map of

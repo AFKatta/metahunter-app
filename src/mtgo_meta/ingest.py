@@ -14,9 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mtgo_meta.config import find_mtgo_appfiles_dirs
-from mtgo_meta.parser import parse_game_log
-from mtgo_meta.parser.game_history import build_format_index, format_for_mtime
-from mtgo_meta.parser.game_log import PARSER_VERSION
+from metahunter_core.parser import parse_game_log
+from metahunter_core.parser.game_history import build_format_index, format_for_mtime
+from metahunter_core.parser.game_log import PARSER_VERSION
 from mtgo_meta.paths import default_db_path
 from mtgo_meta.store import open_store
 

@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from mtgo_meta.classifier import (
+from metahunter_core.classifier import (
     SKIP_LABEL,
     build_card_colors,
     build_card_weights,
@@ -149,7 +149,7 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             )
             return name
         # No corpus for this format — produce a colour-code label.
-        from mtgo_meta.classifier import (
+        from metahunter_core.classifier import (
             SKIP_LABEL, _LAND_NAMES, _TOKENS, infer_color_identity,
         )
         if not cards:

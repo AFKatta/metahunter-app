@@ -21,7 +21,7 @@ from watchdog.observers import Observer
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from mtgo_meta.config import find_mtgo_appfiles_dir
-from mtgo_meta.parser import parse_game_log
+from metahunter_core.parser import parse_game_log
 from mtgo_meta.store import open_store
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

@@ -30,13 +30,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from mtgo_meta.classifier import (
+from metahunter_core.classifier import (
     Archetype,
     _conditions_match,
     load_legacy,
 )
-from mtgo_meta.naming import full_name
-from mtgo_meta.sources.mtgo_com import (
+from metahunter_core.naming import full_name
+from metahunter_core.sources.mtgo_com import (
     Card, Deck, KNOWN_FORMAT_SLUGS, fetch_recent_decks,
 )
 

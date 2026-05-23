@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mtgo_meta.parser.game_log import ParsedMatch
+from metahunter_core.parser.game_log import ParsedMatch
 
 SCHEMA_VERSION = 1
 
