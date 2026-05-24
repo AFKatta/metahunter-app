@@ -60,14 +60,18 @@ hiddenimports = [
 
 a = Analysis(
     ["scripts/serve.py"],
-    # The metahunter_core package is vendored at
-    # packages/metahunter-core/src/. It's a separate package from
-    # mtgo_meta and lives outside the default src/ path, so we add
-    # its src/ directory explicitly here.
+    # metahunter_core lives in a sibling repo cloned next to this
+    # one. Build expects the layout:
+    #
+    #   C:\Code\metahunter-core\        (the sibling clone)
+    #   C:\Code\metahunter-app\         (this repo, ROOT)
+    #
+    # The build.ps1 script verifies the sibling is present before
+    # invoking PyInstaller.
     pathex=[
         str(ROOT),
         str(ROOT / "src"),
-        str(ROOT / "packages" / "metahunter-core" / "src"),
+        str(ROOT.parent / "metahunter-core" / "src"),
     ],
     binaries=[],
     datas=datas,
