@@ -151,4 +151,43 @@ export const api = {
     get<MatchupRow[]>(`/api/matchups${qs(r)}`),
   match: (id: string) => get<MatchDetail>(`/api/match/${id}`),
   matchLog: (id: string) => get<MatchLog>(`/api/match/${id}/log`),
+  uploadState: () => get<UploadState>("/api/upload/state"),
+  uploadConsent: (leaderboard_opt_in: boolean) =>
+    postJson<UploadState>("/api/upload/consent", { leaderboard_opt_in }),
+  uploadPatchLeaderboard: (leaderboard_opt_in: boolean) =>
+    patchJson<UploadState>("/api/upload/leaderboard", { leaderboard_opt_in }),
+  uploadWipe: () => del("/api/upload/all"),
+}
+
+export type UploadState = {
+  install_id: string
+  consented_at: string | null
+  has_consented: boolean
+  leaderboard_opt_in: boolean
+  server_url: string
+}
+
+async function postJson<T>(url: string, body: unknown): Promise<T> {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText} on ${url}`)
+  return r.json() as Promise<T>
+}
+
+async function patchJson<T>(url: string, body: unknown): Promise<T> {
+  const r = await fetch(url, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText} on ${url}`)
+  return r.json() as Promise<T>
+}
+
+async function del(url: string): Promise<void> {
+  const r = await fetch(url, { method: "DELETE" })
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText} on ${url}`)
 }

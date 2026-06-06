@@ -181,6 +181,15 @@ def main() -> int:
 
     app = create_app(db_path=Path(args.db))
 
+    # Phase 2: spin up the background uploader. It runs in a daemon
+    # thread, so process exit kills it without ceremony. The first
+    # sweep bails out cheaply (no consent / no corpus); only AFTER
+    # the user accepts the consent dialog will it start posting
+    # matches.
+    from mtgo_meta.upload.worker import Uploader
+    _uploader = Uploader()
+    _uploader.start()
+
     public_url = f"http://metahunter.localhost:{port}"
     direct_url = f"http://{args.host}:{port}"
     print(f"\nMetahunter listening at:\n  {public_url}\n  {direct_url}\n")

@@ -53,63 +53,12 @@ from metahunter_core.classifier import (
     build_card_colors, build_card_weights, classify_by_similarity,
     recompute_deck_color_identity,
 )
-from mtgo_meta.paths import corpus_path, default_db_path, user_data_dir
+from mtgo_meta.paths import corpus_path, default_db_path
 from mtgo_meta.store import open_store
+from mtgo_meta.upload.client import DEFAULT_SERVER_URL, CLIENT_VERSION
+from mtgo_meta.upload.state import hash_username, load_or_create_state
 
-# Bump this when the wire format changes so the server can pin/reject.
-CLIENT_VERSION = "metahunter-app/backfill/0.1.0"
-
-DEFAULT_SERVER_URL = "http://localhost:8001"
 DEFAULT_BATCH_SIZE = 100
-
-
-# ---------------------------------------------------------------------------
-# Per-install identity (install_id + install_salt)
-# ---------------------------------------------------------------------------
-
-def _state_path() -> Path:
-    return user_data_dir() / "upload_state.json"
-
-
-def load_or_create_state() -> tuple[uuid.UUID, bytes]:
-    """Return (install_id, install_salt), creating both if missing.
-
-    The salt is 32 bytes of os.urandom, hex-encoded to JSON. It
-    NEVER leaves this machine — it's used only to HMAC opponent
-    usernames before they're sent up.
-    """
-    path = _state_path()
-    if path.exists():
-        try:
-            blob = json.loads(path.read_text(encoding="utf-8"))
-            return uuid.UUID(blob["install_id"]), bytes.fromhex(blob["install_salt"])
-        except (KeyError, ValueError, json.JSONDecodeError):
-            # corrupted state — fall through and regenerate
-            pass
-    install_id = uuid.uuid4()
-    install_salt = secrets.token_bytes(32)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({
-            "install_id": str(install_id),
-            "install_salt": install_salt.hex(),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }, indent=2),
-        encoding="utf-8",
-    )
-    print(f"  new install identity at {path}")
-    return install_id, install_salt
-
-
-def hash_username(salt: bytes, username: str) -> str:
-    """HMAC-SHA256 of the MTGO username, hex-encoded.
-
-    Same name from two different installs hashes to two different
-    values because of the per-install salt — so the server can't
-    correlate "this opponent on install A == this opponent on
-    install B" without one of those installs leaking its salt.
-    """
-    return hmac.new(salt, username.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 # ---------------------------------------------------------------------------

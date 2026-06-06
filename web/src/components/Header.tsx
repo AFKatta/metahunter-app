@@ -10,6 +10,7 @@ const links = [
   { to: "/", label: "Overview", end: true },
   { to: "/matches", label: "Matches" },
   { to: "/matchups", label: "Matchups" },
+  { to: "/settings", label: "Settings" },
 ]
 
 export function Header() {

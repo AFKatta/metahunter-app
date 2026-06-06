@@ -69,6 +69,11 @@ def create_app(db_path: Path | None = None) -> FastAPI:
     db = db_path or DEFAULT_DB
     app = FastAPI(title="Metahunter", version="0.0.1")
 
+    # Phase 2: surface the local /api/upload/* routes — consent
+    # gate, leaderboard toggle, server-data wipe button.
+    from mtgo_meta.api.upload_routes import router as upload_router
+    app.include_router(upload_router)
+
     # Allow the Vite dev server (default 5173) to talk to us in dev.
     app.add_middleware(
         CORSMiddleware,
@@ -77,7 +82,7 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             "http://127.0.0.1:5173",
             "http://metahunter.localhost:5173",
         ],
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["*"],
     )
 
