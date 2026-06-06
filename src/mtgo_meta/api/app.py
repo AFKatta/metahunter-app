@@ -74,6 +74,12 @@ def create_app(db_path: Path | None = None) -> FastAPI:
     from mtgo_meta.api.upload_routes import router as upload_router
     app.include_router(upload_router)
 
+    # Phase 6: in-app auto-updater. Routes are no-ops when no newer
+    # release exists upstream — the background worker handles the
+    # GitHub poll + download, the frontend banner consumes state.
+    from mtgo_meta.api.updater_routes import router as updater_router
+    app.include_router(updater_router)
+
     # Allow the Vite dev server (default 5173) to talk to us in dev.
     app.add_middleware(
         CORSMiddleware,

@@ -157,6 +157,25 @@ export const api = {
   uploadPatchLeaderboard: (leaderboard_opt_in: boolean) =>
     patchJson<UploadState>("/api/upload/leaderboard", { leaderboard_opt_in }),
   uploadWipe: () => del("/api/upload/all"),
+  updaterState: () => get<UpdaterState>("/api/updater/state"),
+  updaterCheck: () => postJson<UpdaterState>("/api/updater/check", {}),
+  updaterInstall: () =>
+    // The server kills itself mid-response when the installer fires;
+    // we expect EITHER a 200 or a network error, both meaning "go".
+    postJson<UpdaterState>("/api/updater/install", {}).catch(() => null),
+}
+
+export type UpdaterState = {
+  current_version: string
+  latest_version: string | null
+  update_available: boolean
+  installer_url: string | null
+  release_notes: string | null
+  error: string | null
+  downloaded: boolean
+  download_pct: number | null
+  last_checked_at: number
+  last_error: string | null
 }
 
 export type UploadState = {

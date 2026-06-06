@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query"
 import { Route, Routes } from "react-router-dom"
 import { Header } from "@/components/Header"
 import { ConsentDialog } from "@/components/ConsentDialog"
+import { UpdateBanner } from "@/components/UpdateBanner"
 import { Overview } from "@/routes/Overview"
 import { Matches } from "@/routes/Matches"
 import { Matchups } from "@/routes/Matchups"
@@ -28,6 +29,7 @@ function App() {
 
   return (
     <div className="min-h-svh bg-background text-foreground">
+      <UpdateBanner />
       <Header />
       <main>
         <Routes>

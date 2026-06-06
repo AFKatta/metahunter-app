@@ -1,23 +1,62 @@
 #requires -Version 5
 <#
 .SYNOPSIS
-    One-shot Windows build of Metahunter.exe + shareable zip.
+    One-shot Windows build of Metahunter — produces both the
+    plain-zip distribution AND an Inno Setup installer for auto-
+    update support.
 
 .DESCRIPTION
     1. Builds the React frontend (web/).
     2. Runs PyInstaller against metahunter.spec.
     3. Drops a friend-facing README.txt into dist/Metahunter/.
-    4. Zips dist/Metahunter/ into dist/Metahunter-<date>.zip.
+    4. Zips dist/Metahunter/ into dist/Metahunter-v<ver>-windows.zip
+       (plus a stable-named alias Metahunter-windows.zip for the
+       in-app updater).
+    5. Invokes Inno Setup (iscc) against installer.iss to produce
+       dist/Metahunter-Setup-v<ver>.exe (plus a stable-named alias
+       Metahunter-Setup.exe).
+
+.PARAMETER Sign
+    Optional. When passed AND the env vars below are set, code-signs
+    both Metahunter.exe and the installer with signtool. Default
+    (unsigned) builds skip this. Required env vars:
+        $env:SIGN_CERT_THUMBPRINT  — hash of the cert in CurrentUser/My
+        $env:SIGN_TIMESTAMP_URL    — e.g. http://timestamp.digicert.com
+
+.PARAMETER NoInstaller
+    Skip the Inno Setup step (e.g. when iscc isn't on PATH). Just
+    produces the zip.
 
 .NOTES
     Run from the project root with the .venv activated.
         .\.venv\Scripts\Activate.ps1
         .\build.ps1
+
+    Prereqs:
+        * Node.js  (for the frontend build)
+        * Python   (with PyInstaller installed in the venv)
+        * Inno Setup 6+ (for the installer step;
+          https://jrsoftware.org/isdl.php — adds iscc to PATH)
 #>
+
+[CmdletBinding()]
+param(
+    [switch]$Sign,
+    [switch]$NoInstaller
+)
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
+
+# Pull the canonical version out of __init__.py — same source of
+# truth the runtime uses. Single point of truth for every artifact
+# name and the installer's VS_VERSIONINFO.
+$versionMatch = (Get-Content "src\mtgo_meta\__init__.py" -Raw) -match '__version__\s*=\s*"([^"]+)"'
+if (-not $versionMatch) { throw "Couldn't read __version__ from src\mtgo_meta\__init__.py" }
+$Version = $Matches[1]
+Write-Host "Building Metahunter v$Version" -ForegroundColor Cyan
+Write-Host ""
 
 Write-Host "==> 1/4  Building React frontend"
 Push-Location web
@@ -119,16 +158,82 @@ REPORT ISSUES
 $readme | Set-Content -Encoding UTF8 -Path "dist\Metahunter\README.txt"
 
 Write-Host ""
-Write-Host "==> 4/4  Zipping distributable"
-$ts = Get-Date -Format "yyyy-MM-dd"
-$zip = "dist\Metahunter-$ts.zip"
+Write-Host "==> 4/5  Optionally signing Metahunter.exe"
+if ($Sign) {
+    if (-not $env:SIGN_CERT_THUMBPRINT -or -not $env:SIGN_TIMESTAMP_URL) {
+        throw "-Sign requires `$env:SIGN_CERT_THUMBPRINT and `$env:SIGN_TIMESTAMP_URL"
+    }
+    & signtool sign /sha1 $env:SIGN_CERT_THUMBPRINT /fd sha256 /td sha256 `
+        /tr $env:SIGN_TIMESTAMP_URL /d "Metahunter" /du "https://metahunter-web.vercel.app" `
+        "dist\Metahunter\Metahunter.exe"
+    if ($LASTEXITCODE -ne 0) { throw "signtool failed on Metahunter.exe" }
+    Write-Host "  signed Metahunter.exe"
+} else {
+    Write-Host "  -Sign not passed; skipping"
+}
+
+Write-Host ""
+Write-Host "==> 5/5  Packaging"
+
+# Versioned zip — kept for archival downloads.
+$zip = "dist\Metahunter-v$Version-windows.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path "dist\Metahunter" -DestinationPath $zip -CompressionLevel Optimal
+Write-Host "  zipped : $zip"
+
+# Stable-name copy. The landing page's Download button + the in-app
+# updater both fetch via /releases/latest/download/Metahunter-windows.zip
+# (and Metahunter-Setup.exe below).
+$zipStable = "dist\Metahunter-windows.zip"
+if (Test-Path $zipStable) { Remove-Item -Force $zipStable }
+Copy-Item -Path $zip -Destination $zipStable
+Write-Host "  alias  : $zipStable"
+
+# Inno Setup installer. Stable AppId in installer.iss means a subsequent
+# install upgrades over the previous one rather than installing a second
+# copy. The in-app updater always downloads the stable-named installer.
+if ($NoInstaller) {
+    Write-Host "  -NoInstaller passed; skipping Inno Setup step"
+} else {
+    $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+    if (-not $iscc) {
+        Write-Warning "Inno Setup (iscc) not on PATH — skipping installer."
+        Write-Warning "Install from https://jrsoftware.org/isdl.php to enable."
+    } else {
+        $signFlag = if ($Sign) { "/DSIGN=1" } else { "" }
+        if ($Sign) {
+            # Register signtool with iscc so SignTool=metahunter inside
+            # installer.iss invokes signtool with the right thumbprint.
+            $signCmd = "signtool.exe sign /sha1 $env:SIGN_CERT_THUMBPRINT /fd sha256 /td sha256 /tr $env:SIGN_TIMESTAMP_URL /d Metahunter `$f"
+            & iscc /Smetahunter="$signCmd" $signFlag installer.iss
+        } else {
+            & iscc installer.iss
+        }
+        if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
+
+        $installer = "dist\Metahunter-Setup-v$Version.exe"
+        $installerStable = "dist\Metahunter-Setup.exe"
+        if (Test-Path $installerStable) { Remove-Item -Force $installerStable }
+        Copy-Item -Path $installer -Destination $installerStable
+        Write-Host "  setup  : $installer"
+        Write-Host "  alias  : $installerStable"
+    }
+}
 
 Write-Host ""
 Write-Host "Build complete." -ForegroundColor Green
-Write-Host "  Executable: dist\Metahunter\Metahunter.exe"
-Write-Host "  Shareable : $zip"
+Write-Host "  Executable     : dist\Metahunter\Metahunter.exe"
+Write-Host "  Versioned zip  : $zip"
+Write-Host "  Stable zip     : dist\Metahunter-windows.zip"
+if (-not $NoInstaller -and (Get-Command iscc -ErrorAction SilentlyContinue)) {
+    Write-Host "  Installer      : dist\Metahunter-Setup-v$Version.exe"
+    Write-Host "  Stable inst.   : dist\Metahunter-Setup.exe"
+}
 Write-Host ""
-Write-Host "Test it locally with:"
+Write-Host "Test the .exe locally with:"
 Write-Host "    .\dist\Metahunter\Metahunter.exe"
+if (-not $NoInstaller -and (Get-Command iscc -ErrorAction SilentlyContinue)) {
+    Write-Host ""
+    Write-Host "Test the installer locally with:"
+    Write-Host "    .\dist\Metahunter-Setup-v$Version.exe"
+}

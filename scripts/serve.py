@@ -190,6 +190,14 @@ def main() -> int:
     _uploader = Uploader()
     _uploader.start()
 
+    # Phase 6: spin up the auto-updater. Polls GitHub Releases every
+    # 12h. First poll fires immediately so the dashboard's update
+    # banner is correct on the very first dashboard load instead of
+    # waiting half a day.
+    from mtgo_meta.updater.worker import get_singleton as _get_updater
+    _updater = _get_updater()
+    _updater.start()
+
     public_url = f"http://metahunter.localhost:{port}"
     direct_url = f"http://{args.host}:{port}"
     print(f"\nMetahunter listening at:\n  {public_url}\n  {direct_url}\n")

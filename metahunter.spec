@@ -13,11 +13,56 @@
 # Run:    pyinstaller metahunter.spec
 # Output: dist/Metahunter/Metahunter.exe
 
+import sys
 from pathlib import Path
 
 block_cipher = None
 
 ROOT = Path(SPECPATH).resolve()
+
+# Pull the build version out of src/mtgo_meta/__init__.py — single
+# source of truth shared by the runtime updater + installer.iss +
+# build.ps1.
+sys.path.insert(0, str(ROOT / "src"))
+from mtgo_meta import __version__ as VERSION  # noqa: E402
+
+# VS_VERSIONINFO struct — Windows reads this for Properties → Details.
+def _vs_version_tuple(s: str) -> tuple[int, int, int, int]:
+    parts = [int(p) for p in s.split(".") if p.isdigit()]
+    while len(parts) < 4:
+        parts.append(0)
+    return tuple(parts[:4])  # type: ignore[return-value]
+
+VERSION_FILE_TUPLE = _vs_version_tuple(VERSION)
+
+from PyInstaller.utils.win32.versioninfo import (
+    VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable,
+    StringStruct, VarFileInfo, VarStruct,
+)
+
+version_info = VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=VERSION_FILE_TUPLE,
+        prodvers=VERSION_FILE_TUPLE,
+        mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0,
+        date=(0, 0),
+    ),
+    kids=[
+        StringFileInfo([
+            StringTable("040904B0", [
+                StringStruct("CompanyName", "AFKatta"),
+                StringStruct("FileDescription", "Metahunter — MTGO Legacy match analyser"),
+                StringStruct("FileVersion", VERSION),
+                StringStruct("InternalName", "Metahunter"),
+                StringStruct("LegalCopyright", "© AFKatta"),
+                StringStruct("OriginalFilename", "Metahunter.exe"),
+                StringStruct("ProductName", "Metahunter"),
+                StringStruct("ProductVersion", VERSION),
+            ]),
+        ]),
+        VarFileInfo([VarStruct("Translation", [1033, 1200])]),
+    ],
+)
 
 datas = []
 
@@ -108,6 +153,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    # Windows Properties → Details metadata.
+    version=version_info,
 )
 coll = COLLECT(
     exe,
