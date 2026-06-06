@@ -1,6 +1,6 @@
 [project]
 name = "mtgo-meta"
-version = "0.0.1"
+version = "0.1.0"
 description = "Local MTGO match-log scraper and personal meta dashboard"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,6 +13,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    "httpx>=0.27",       # FastAPI TestClient
+    "pyinstaller>=6.0",  # builds the distributable .exe
 ]
 # Pulled in once we start the API/UI/watcher pieces:
 # api = ["fastapi", "uvicorn[standard]"]

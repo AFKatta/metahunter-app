@@ -82,13 +82,30 @@ HOW TO RUN
   2. A console window opens with status — leave it open.
   3. Your default browser opens automatically at
        http://metahunter.localhost:8765
-  4. Close the console window to stop.
+  4. First run: a consent dialog appears. Read it, tick the box,
+     click Continue. (One-time. You can revoke from Settings.)
+  5. Close the console window to stop.
 
-DATA
-  All your matches are stored at
-    %LOCALAPPDATA%\Metahunter\mtgo-meta.sqlite
-  Nothing is uploaded anywhere. (A central friend-network is planned;
-  that will be a separate, opt-in feature with anonymised opponent IDs.)
+WHAT GETS SHARED
+  After consent: match metadata (your archetype, opponent's
+  archetype, cards observed, on-play, who won) is sent to
+  metahunter-api.fly.dev. Your MTGO username goes up plaintext;
+  every opponent's username is HMAC-hashed against a 32-byte
+  secret that is generated on your machine on first run and never
+  leaves your PC. See the community meta at
+    https://metahunter-web.vercel.app
+
+WHAT STAYS LOCAL
+  All raw match data + your install secret live at
+    %LOCALAPPDATA%\Metahunter\
+  Don't want your name on the leaderboard? Flip "Show me on the
+  leaderboard" off in Settings — your matches still count toward
+  aggregate stats, the name just stays hidden.
+
+WIPE EVERYTHING
+  Settings -> "Wipe my server data" deletes your install row +
+  every match this install uploaded, then re-prompts the consent
+  dialog on next launch.
 
 WINDOWS SMARTSCREEN WARNING
   The .exe is not code-signed yet, so Windows may say
@@ -97,8 +114,7 @@ WINDOWS SMARTSCREEN WARNING
   default warning for un-signed downloaded binaries.
 
 REPORT ISSUES
-  If a deck is misclassified or the dashboard breaks, screenshot the
-  Matches table and the console window and send it back.
+  https://github.com/AFKatta/metahunter-app/issues
 "@
 $readme | Set-Content -Encoding UTF8 -Path "dist\Metahunter\README.txt"
 
