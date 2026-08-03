@@ -1,7 +1,7 @@
 #requires -Version 5
 <#
 .SYNOPSIS
-    One-shot Windows build of Metahunter — produces both the
+    One-shot Windows build of Metahunter -- produces both the
     plain-zip distribution AND an Inno Setup installer for auto-
     update support.
 
@@ -20,8 +20,8 @@
     Optional. When passed AND the env vars below are set, code-signs
     both Metahunter.exe and the installer with signtool. Default
     (unsigned) builds skip this. Required env vars:
-        $env:SIGN_CERT_THUMBPRINT  — hash of the cert in CurrentUser/My
-        $env:SIGN_TIMESTAMP_URL    — e.g. http://timestamp.digicert.com
+        $env:SIGN_CERT_THUMBPRINT  -- hash of the cert in CurrentUser/My
+        $env:SIGN_TIMESTAMP_URL    -- e.g. http://timestamp.digicert.com
 
 .PARAMETER NoInstaller
     Skip the Inno Setup step (e.g. when iscc isn't on PATH). Just
@@ -36,7 +36,7 @@
         * Node.js  (for the frontend build)
         * Python   (with PyInstaller installed in the venv)
         * Inno Setup 6+ (for the installer step;
-          https://jrsoftware.org/isdl.php — adds iscc to PATH)
+          https://jrsoftware.org/isdl.php -- adds iscc to PATH)
 #>
 
 [CmdletBinding()]
@@ -49,7 +49,7 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 
-# Pull the canonical version out of __init__.py — same source of
+# Pull the canonical version out of __init__.py -- same source of
 # truth the runtime uses. Single point of truth for every artifact
 # name and the installer's VS_VERSIONINFO.
 $versionMatch = (Get-Content "src\mtgo_meta\__init__.py" -Raw) -match '__version__\s*=\s*"([^"]+)"'
@@ -84,7 +84,7 @@ if ($running) {
     Start-Sleep -Milliseconds 500
 }
 
-# Retry the directory delete a few times — OneDrive can briefly lock
+# Retry the directory delete a few times -- OneDrive can briefly lock
 # files even after the process is gone.
 $dirs = @("build", "dist")
 foreach ($d in $dirs) {
@@ -118,7 +118,7 @@ WHAT IT IS
 
 HOW TO RUN
   1. Double-click Metahunter.exe.
-  2. A console window opens with status — leave it open.
+  2. A console window opens with status -- leave it open.
   3. Your default browser opens automatically at
        http://metahunter.localhost:8765
   4. First run: a consent dialog appears. Read it, tick the box,
@@ -138,7 +138,7 @@ WHAT STAYS LOCAL
   All raw match data + your install secret live at
     %LOCALAPPDATA%\Metahunter\
   Don't want your name on the leaderboard? Flip "Show me on the
-  leaderboard" off in Settings — your matches still count toward
+  leaderboard" off in Settings -- your matches still count toward
   aggregate stats, the name just stays hidden.
 
 WIPE EVERYTHING
@@ -149,7 +149,7 @@ WIPE EVERYTHING
 WINDOWS SMARTSCREEN WARNING
   The .exe is not code-signed yet, so Windows may say
     "Windows protected your PC."
-  Click "More info" -> "Run anyway." It's safe — this is just the
+  Click "More info" -> "Run anyway." It's safe -- this is just the
   default warning for un-signed downloaded binaries.
 
 REPORT ISSUES
@@ -175,7 +175,7 @@ if ($Sign) {
 Write-Host ""
 Write-Host "==> 5/5  Packaging"
 
-# Versioned zip — kept for archival downloads.
+# Versioned zip -- kept for archival downloads.
 $zip = "dist\Metahunter-v$Version-windows.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path "dist\Metahunter" -DestinationPath $zip -CompressionLevel Optimal
@@ -197,7 +197,7 @@ if ($NoInstaller) {
 } else {
     $iscc = Get-Command iscc -ErrorAction SilentlyContinue
     if (-not $iscc) {
-        Write-Warning "Inno Setup (iscc) not on PATH — skipping installer."
+        Write-Warning "Inno Setup (iscc) not on PATH -- skipping installer."
         Write-Warning "Install from https://jrsoftware.org/isdl.php to enable."
     } else {
         $signFlag = if ($Sign) { "/DSIGN=1" } else { "" }

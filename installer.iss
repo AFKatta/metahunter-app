@@ -7,7 +7,7 @@
 ;
 ; Install layout:
 ;     %LOCALAPPDATA%\Programs\Metahunter\           (binaries)
-;     %LOCALAPPDATA%\Metahunter\                    (data — created
+;     %LOCALAPPDATA%\Metahunter\                    (data -- created
 ;                                                    on first run by
 ;                                                    paths.py)
 ;
@@ -26,7 +26,7 @@
 #define AppURL         "https://metahunter-web.vercel.app"
 #define AppExe         "Metahunter.exe"
 ; Stable AppId so subsequent installers UPGRADE in place rather than
-; installing a parallel copy. NEVER change this between versions —
+; installing a parallel copy. NEVER change this between versions --
 ; it's the join key Windows uses for "already installed?" checks.
 #define AppId          "{{8B5C4E2A-3F1D-4A6E-9E2A-2E9D7C3F5A41}}"
 
