@@ -20,9 +20,14 @@ function systemPref(): ResolvedTheme {
 }
 
 function readStored(): Theme {
-  if (typeof window === "undefined") return "system"
+  // Dark is the default, not "system". The palette is designed dark
+  // first, and Chromium inside the desktop shell reports
+  // prefers-color-scheme: light regardless of the Windows setting, so
+  // "system" made the app open white. Light is still one toggle away
+  // and the choice persists.
+  if (typeof window === "undefined") return "dark"
   const raw = window.localStorage.getItem(STORAGE_KEY)
-  return raw === "light" || raw === "dark" || raw === "system" ? raw : "system"
+  return raw === "light" || raw === "dark" || raw === "system" ? raw : "dark"
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {

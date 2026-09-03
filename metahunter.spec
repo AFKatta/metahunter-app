@@ -74,9 +74,14 @@ if web_dist.exists():
 # Archetype corpus snapshot (read-only inside the bundle; the user's
 # updated copy lives in %LOCALAPPDATA%/Metahunter/corpus/ if they
 # refresh it).
-corpus = ROOT / "data" / "corpus" / "legacy.json"
-if corpus.exists():
-    datas.append((str(corpus), "data/corpus"))
+# Ship every corpus we have, not just Legacy. The classifier picks the
+# one matching the match's own format at request time, and a format
+# whose corpus is absent silently degrades to colour-code labels — so
+# naming a single file here quietly capped the app at one format.
+corpus_dir = ROOT / "data" / "corpus"
+if corpus_dir.is_dir():
+    for corpus_file in sorted(corpus_dir.glob("*.json")):
+        datas.append((str(corpus_file), "data/corpus"))
 
 # Badaro archetype rules.
 fmt_data = ROOT / "data" / "MTGOFormatData"

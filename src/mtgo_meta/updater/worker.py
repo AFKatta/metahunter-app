@@ -74,6 +74,14 @@ class Updater:
         log.info("updater: thread exiting")
 
     def start(self) -> None:
+        # When an outer shell (the Electron desktop build) owns updating,
+        # stand down. Two updaters polling the same GitHub release and
+        # both trying to replace the same installation is how you end up
+        # with a half-written app directory; whoever owns the process
+        # tree owns the update.
+        if os.environ.get("METAHUNTER_DISABLE_SELF_UPDATE") == "1":
+            log.info("updater: disabled by METAHUNTER_DISABLE_SELF_UPDATE")
+            return
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
@@ -144,10 +152,34 @@ class Updater:
         with self._lock:
             self._state.download_pct = min(100.0, 100.0 * done / total)
 
+
+def _silent_install_args(installer: Path) -> list[str]:
+    """Silent-install flags appropriate to whichever installer this is.
+
+    Inno Setup and NSIS use different, mutually unrecognised flags:
+    Inno wants ``/SILENT``, NSIS wants ``/S``. Passing the wrong one
+    either shows a full installer UI mid-session or fails outright.
+
+    We used to ship Inno only, so the flags were hardcoded. Now that an
+    NSIS-based build exists, sniff the file rather than assume: both
+    toolchains leave an unmistakable marker in the binary. Unknown
+    files fall back to Inno, which is what every release so far has
+    been.
+    """
+    try:
+        head = installer.read_bytes()[:2_000_000]
+    except OSError:
+        head = b""
+
+    if b"Nullsoft" in head or b"NSIS" in head:
+        # NSIS: /S is silent, /D would set the directory (must be last).
+        return ["/S"]
+    return ["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
+
     # ---- install trigger ---------------------------------------------
 
     def install_and_exit(self) -> None:
-        """Spawn the downloaded installer with /SILENT and exit this
+        """Spawn the downloaded installer silently and exit this
         process. Inno Setup's installer takes care of closing any
         running Metahunter.exe (CloseApplications=force in the script)
         before overwriting the install dir.
@@ -167,7 +199,7 @@ class Updater:
         CREATE_NEW_PROCESS_GROUP = 0x00000200
         flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         subprocess.Popen(
-            [str(inst), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+            [str(inst), *_silent_install_args(inst)],
             creationflags=flags,
             close_fds=True,
         )

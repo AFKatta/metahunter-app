@@ -25,3 +25,9 @@ web/dist/
 # editor
 .idea/
 .vscode/
+
+# Electron build output. These are release artifacts (a ~94 MB installer
+# and a ~125 MB zip) that get attached to a GitHub release, not tracked
+# in the repo — committing them bloats history permanently.
+dist-desktop/
+desktop/node_modules/

@@ -4,7 +4,24 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>web</title>
+    <title>Metahunter</title>
+    <meta name="color-scheme" content="dark light" />
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("metahunter.theme");
+          var dark =
+            stored === "dark" ||
+            (stored !== "light" &&
+              !(stored === "system" &&
+                window.matchMedia("(prefers-color-scheme: light)").matches));
+          if (dark) document.documentElement.classList.add("dark");
+          document.documentElement.style.colorScheme = dark ? "dark" : "light";
+        } catch (e) {
+          document.documentElement.classList.add("dark");
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
