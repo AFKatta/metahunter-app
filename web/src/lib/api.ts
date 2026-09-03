@@ -129,7 +129,114 @@ export type Account = {
   last_played: number
 }
 
+
+/** A card as it appears in a saved MTGO deck. */
+export type DeckCard = {
+  mtgo_id: number
+  quantity: number
+  name: string
+  mana_cost: string
+  type_line: string
+  cmc: number
+  colors: string
+  rarity: string
+  set: string
+  image: string | null
+  art: string | null
+  /** False when the catalog id is not in the card index (old promos). */
+  resolved: boolean
+}
+
+export type KeyCard = {
+  name: string
+  quantity: number
+  mana_cost: string
+  type_line: string
+  image: string | null
+  art: string | null
+}
+
+/** One deck saved in the MTGO client, with how it has performed. */
+export type DecklistRow = {
+  id: string
+  name: string
+  format: string
+  colors: string
+  maindeck_count: number
+  sideboard_count: number
+  modified_at: number
+  wins: number
+  losses: number
+  matches: number
+  winrate: number | null
+  /** Matches that fit several near-identical decks equally well. */
+  ambiguous_matches: number
+  last_played: number | null
+  key_cards: KeyCard[]
+  curve: Record<string, number>
+  resolved_cards: number
+}
+
+export type DecklistsResponse = {
+  decks: DecklistRow[]
+  card_index_size: number
+  attributed_matches: number
+  total_matches: number
+}
+
+export type DeckMatchup = {
+  archetype: string
+  wins: number
+  losses: number
+  matches: number
+  winrate: number | null
+}
+
+export type DeckHistoryRow = {
+  match_id: string
+  played_at: number | null
+  opponent: string
+  opponent_archetype: string
+  result: "W" | "L" | null
+  score: string | null
+  confidence: number
+  ambiguous: boolean
+}
+
+export type DecklistDetail = {
+  id: string
+  name: string
+  format: string
+  colors: string
+  modified_at: number
+  maindeck: DeckCard[]
+  sideboard: DeckCard[]
+  maindeck_count: number
+  sideboard_count: number
+  wins: number
+  losses: number
+  winrate: number | null
+  matchups: DeckMatchup[]
+  history: DeckHistoryRow[]
+  distinct_opponents: number
+  curve: Record<string, number>
+  resolved_cards: number
+}
+
 export const api = {
+  decklists: (r: { user?: string; format?: string; refresh?: boolean } = {}) =>
+    get<DecklistsResponse>(
+      `/api/decklists${qs({
+        user: r.user,
+        format: r.format,
+        // qs() serialises scalars only; the backend parses "true"/"false".
+        refresh: r.refresh ? "true" : undefined,
+      })}`
+    ),
+  decklist: (id: string, r: { user?: string } = {}) =>
+    get<DecklistDetail>(`/api/decklists/${encodeURIComponent(id)}${qs(r)}`),
+  refreshCardIndex: () =>
+    postJson<{ ok: boolean; cards: number }>("/api/decklists/refresh-cards", {}),
   health: () => get<{ ok: boolean; corpus_decks: number; archetypes: number }>("/api/health"),
   formats: (r: { user?: string } = {}) => get<FormatCounts>(`/api/formats${qs(r)}`),
   accounts: () => get<Account[]>("/api/accounts"),

@@ -62,6 +62,16 @@ def user_data_dir() -> Path:
 
 
 # Convenient pre-resolved paths.
+def card_index_path() -> Path:
+    """Where the Scryfall card index is cached.
+
+    Deliberately in the writable user data directory rather than beside
+    the executable: it is downloaded at runtime, refreshed periodically,
+    and must survive an app update that replaces the install folder.
+    """
+    return user_data_dir() / "cards.json"
+
+
 def default_db_path() -> Path:
     return user_data_dir() / "mtgo-meta.sqlite"
 

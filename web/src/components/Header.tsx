@@ -8,6 +8,7 @@ import { AccountPicker } from "@/components/AccountPicker"
 
 const links = [
   { to: "/", label: "Overview", end: true },
+  { to: "/decks", label: "Decks" },
   { to: "/matches", label: "Matches" },
   { to: "/matchups", label: "Matchups" },
   { to: "/settings", label: "Settings" },

@@ -4,6 +4,8 @@ import { Header } from "@/components/Header"
 import { ConsentDialog } from "@/components/ConsentDialog"
 import { UpdateBanner } from "@/components/UpdateBanner"
 import { Overview } from "@/routes/Overview"
+import { Decks } from "@/routes/Decks"
+import { DeckDetail } from "@/routes/DeckDetail"
 import { Matches } from "@/routes/Matches"
 import { Matchups } from "@/routes/Matchups"
 import { MatchDetail } from "@/routes/MatchDetail"
@@ -34,6 +36,8 @@ function App() {
       <main>
         <Routes>
           <Route path="/" element={<Overview />} />
+          <Route path="/decks" element={<Decks />} />
+          <Route path="/decks/:id" element={<DeckDetail />} />
           <Route path="/matches" element={<Matches />} />
           <Route path="/matchups" element={<Matchups />} />
           <Route path="/match/:id" element={<MatchDetail />} />

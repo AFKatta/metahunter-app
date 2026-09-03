@@ -19,6 +19,15 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from metahunter_core.card_index import CardIndex
+from metahunter_core.card_index import build_index as build_card_index
+from metahunter_core.deck_files import load_decks
+from metahunter_core.deck_matching import link_matches
+from metahunter_core.player_index import (
+    MIN_CONSISTENCY,
+    build_player_index,
+    lookup_opponent_deck,
+)
 from metahunter_core.classifier import (
     SKIP_LABEL,
     build_card_colors,
@@ -32,6 +41,7 @@ from metahunter_core.classifier import (
     recompute_deck_color_identity,
 )
 from mtgo_meta.paths import (
+    card_index_path,
     available_corpora,
     corpus_path,
     default_db_path,
@@ -43,6 +53,12 @@ from mtgo_meta.store import open_store
 FORMAT_DATA = format_data_dir()
 DEFAULT_DB = default_db_path()
 WEB_DIST = web_dist_dir()
+
+# Overriding an archetype similarity already named takes stronger
+# agreement from a published decklist than filling in a blank one
+# does. Players change decks between events, so a marginally
+# consistent old list replacing a good inference is a regression.
+PUBLISHED_OVERRIDE_CONSISTENCY = 0.75
 
 SIGNATURE_NOISE = {
     "Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes",
@@ -105,6 +121,8 @@ def create_app(db_path: Path | None = None) -> FastAPI:
     # from all loaded corpora — used as a fallback so colour inference
     # still works for formats without their own corpus.
     corpora: dict[str, dict] = {}
+    # Player name -> the decklists they have published, per format.
+    player_indexes: dict[str, dict] = {}
     universal_card_colors: dict[str, str] = {}
     for fmt_name in available_corpora():
         cp = corpus_path(fmt_name)
@@ -122,6 +140,7 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         weights = build_card_weights(decks)
         colors = build_card_colors(decks)
         corpora[fmt_name] = {"decks": decks, "weights": weights, "colors": colors}
+        player_indexes[fmt_name] = build_player_index(decks)
         # Merge into universal table — first-seen wins. Legacy gets
         # priority simply because it's the largest dataset.
         for name, col in colors.items():
@@ -172,14 +191,58 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         cols = infer_color_identity(cards, universal_card_colors, cast)
         return cols or "Colourless"
 
+    @lru_cache(maxsize=20000)
+    def _published_lookup_cached(
+        cards_key: tuple[str, ...], fmt: str, player: str,
+        min_consistency: float = MIN_CONSISTENCY,
+    ) -> str | None:
+        """Archetype from the player's own published list, if it fits.
+
+        MTGO publishes the full 75 for league 5-0s and challenge top-32
+        finishes, and the corpus already stores the player name against
+        each. When an opponent appears there and what we are seeing
+        agrees with what they registered, that beats inferring from a
+        handful of revealed cards: it identifies the deck from about
+        three cards rather than a dozen.
+
+        Returns None when the player is unknown, the list is stale, or
+        the cards contradict it, so the caller falls through.
+        """
+        fmt_index = player_indexes.get(fmt)
+        if not fmt_index or not player:
+            return None
+        hit = lookup_opponent_deck(
+            fmt_index, player, cards_key, min_consistency=min_consistency
+        )
+        return hit[0].archetype if hit else None
+
     def _classify(
         cards: list[str],
         cast: list[str] | None = None,
         fmt: str = "Legacy",
+        player: str | None = None,
     ) -> str:
         cards_key = tuple(sorted(set(cards)))
         cast_key = tuple(sorted(set(cast))) if cast else ()
-        return _classify_cached(cards_key, cast_key, fmt or "Legacy")
+        fmt = fmt or "Legacy"
+
+        similar = _classify_cached(cards_key, cast_key, fmt)
+        if not player:
+            return similar
+
+        # How much agreement a published list needs depends on what we
+        # would otherwise say. With nothing usable — too few cards, or a
+        # bare colour code — any consistent list is an improvement. To
+        # override an archetype we already named, demand more: players
+        # switch decks, and a marginal old list replacing a good
+        # inference would be a regression, not a fix.
+        weak = similar == SKIP_LABEL or _is_colour_code(similar)
+        threshold = MIN_CONSISTENCY if weak else PUBLISHED_OVERRIDE_CONSISTENCY
+
+        known = _published_lookup_cached(
+            cards_key, fmt, player.lower(), threshold
+        )
+        return known or similar
 
     def _is_colour_code(label: str) -> bool:
         if not label or label == SKIP_LABEL:
@@ -982,6 +1045,300 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         }
 
     # Serve the built frontend in production. The SPA's client-side
+    # ---- saved MTGO decks -----------------------------------------------
+    #
+    # MTGO writes every deck the player saves to its own XML file and keeps
+    # it current as they edit, which makes those files the authoritative
+    # decklist — far better than inferring one from cards observed in play,
+    # which only ever sees what happened to be drawn.
+    #
+    # Attributing a *match* to a specific deck is inference, though, and is
+    # reported as such. MTGO records which deck was registered only in its
+    # rolling text log, which this app does not read yet, so we fall back to
+    # matching on the cards actually cast. That cannot reliably separate
+    # near-identical variants of the same shell, and the response says so
+    # rather than quietly picking one.
+
+    _deck_cache: dict[str, Any] = {"decks": None, "at": 0.0, "links": None,
+                                   "index": None}
+
+    def _card_index():
+        """Scryfall index, loaded once per process."""
+        if _deck_cache.get("index") is None:
+            _deck_cache["index"] = CardIndex.load(card_index_path())
+        return _deck_cache["index"]
+
+    def _saved_decks(force: bool = False) -> list:
+        """Saved decks, re-read at most every 30 seconds.
+
+        MTGO rewrites these files as the player edits, so a long cache
+        would go stale mid-session. Re-reading ~65 small XML files is
+        cheap enough that a short TTL beats a file watcher.
+        """
+        now = time.time()
+        if force or _deck_cache["decks"] is None or now - _deck_cache["at"] > 30:
+            try:
+                _deck_cache["decks"] = load_decks(constructed_only=True)
+            except Exception:  # noqa: BLE001
+                _deck_cache["decks"] = []
+            _deck_cache["at"] = now
+            _deck_cache["links"] = None
+        return _deck_cache["decks"] or []
+
+    def _deck_links(matches: list, user: str) -> dict:
+        if _deck_cache.get("links") is None:
+            try:
+                _deck_cache["links"] = link_matches(
+                    matches, _saved_decks(), _card_index(), user
+                )
+            except Exception:  # noqa: BLE001
+                _deck_cache["links"] = {}
+        return _deck_cache["links"] or {}
+
+    _WUBRG = "WUBRG"
+
+    def _deck_summary(deck, index) -> dict[str, Any]:
+        """Colour identity, mana curve and how much of the list resolved."""
+        colors: set[str] = set()
+        curve: dict[str, int] = defaultdict(int)
+        resolved = 0
+        for c in deck.maindeck:
+            rec = index.get(c.mtgo_id)
+            if rec is None:
+                continue
+            resolved += 1
+            colors.update(rec.color_identity or "")
+            if not rec.is_land:
+                key = str(int(rec.cmc)) if rec.cmc < 7 else "7+"
+                curve[key] += c.quantity
+        ordered = sorted(colors, key=lambda ch: _WUBRG.index(ch)
+                         if ch in _WUBRG else 99)
+        return {
+            "colors": "".join(ordered),
+            "curve": dict(sorted(curve.items())),
+            "resolved_cards": resolved,
+        }
+
+    def _key_cards(deck, index, limit: int = 5) -> list[dict[str, Any]]:
+        """The cards a player would recognise this deck by.
+
+        Four-ofs first, then by mana value descending, so the payoff shows
+        rather than the cantrips every blue deck runs. Lands are set aside
+        unless the deck has essentially nothing else, which is how
+        land-defined decks still get a sensible face.
+        """
+        rows = []
+        for c in deck.maindeck:
+            rec = index.get(c.mtgo_id)
+            if rec is None or rec.is_basic_land:
+                continue
+            rows.append((c.quantity, rec))
+        nonland = [r for r in rows if not r[1].is_land]
+        pool = nonland or rows
+        pool.sort(key=lambda t: (-t[0], -t[1].cmc, t[1].name))
+        return [
+            {
+                "name": rec.name,
+                "quantity": qty,
+                "mana_cost": rec.mana_cost,
+                "type_line": rec.type_line,
+                "image": rec.image_url("normal"),
+                "art": rec.image_url("art_crop"),
+            }
+            for qty, rec in pool[:limit]
+        ]
+
+    @app.get("/api/decklists")
+    def decklists(
+        user_override: str | None = Query(None, alias="user"),
+        fmt: str | None = Query(None, alias="format"),
+        refresh: bool = Query(False),
+    ) -> dict[str, Any]:
+        """Every deck saved in the MTGO client, with how it has performed."""
+        index = _card_index()
+        decks = _saved_decks(force=refresh)
+        user = _resolve_user(user_override)
+
+        matches = _all_matches(None, fmt="") if user else []
+        links = _deck_links(matches, user) if user else {}
+
+        agg: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {"wins": 0, "losses": 0, "ambiguous": 0, "last_played": 0.0}
+        )
+        for m in matches:
+            hit = links.get(m.match_id)
+            if hit is None or not m.match_winner:
+                continue
+            a = agg[hit.deck_id]
+            if m.match_winner == user:
+                a["wins"] += 1
+            else:
+                a["losses"] += 1
+            if hit.ambiguous:
+                a["ambiguous"] += 1
+            a["last_played"] = max(a["last_played"], m.log_mtime or 0.0)
+
+        out = []
+        for d in decks:
+            if fmt and d.format.lower() != fmt.lower():
+                continue
+            rec = agg.get(d.deck_id)
+            wins = rec["wins"] if rec else 0
+            losses = rec["losses"] if rec else 0
+            played = wins + losses
+            out.append({
+                "id": d.deck_id,
+                "name": d.name,
+                "format": d.format,
+                "maindeck_count": d.maindeck_count,
+                "sideboard_count": d.sideboard_count,
+                "modified_at": d.modified_at,
+                "wins": wins,
+                "losses": losses,
+                "matches": played,
+                "winrate": (wins / played) if played else None,
+                "ambiguous_matches": rec["ambiguous"] if rec else 0,
+                "last_played": (rec["last_played"] or None) if rec else None,
+                "key_cards": _key_cards(d, index),
+                **_deck_summary(d, index),
+            })
+
+        out.sort(key=lambda r: (r["last_played"] or 0, r["modified_at"]),
+                 reverse=True)
+        return {
+            "decks": out,
+            "card_index_size": len(index),
+            "attributed_matches": len(links),
+            "total_matches": len(matches),
+        }
+
+    @app.get("/api/decklists/{deck_id}")
+    def decklist_detail(
+        deck_id: str,
+        user_override: str | None = Query(None, alias="user"),
+    ) -> dict[str, Any]:
+        """One deck: the full 75, who it has faced, and when."""
+        index = _card_index()
+        deck = next((d for d in _saved_decks() if d.deck_id == deck_id), None)
+        if deck is None:
+            raise HTTPException(status_code=404, detail="deck not found")
+
+        def render(cards) -> list[dict[str, Any]]:
+            rows = []
+            for c in cards:
+                rec = index.get(c.mtgo_id)
+                rows.append({
+                    "mtgo_id": c.mtgo_id,
+                    "quantity": c.quantity,
+                    # An unresolved catalog id still appears, labelled, so
+                    # the list stays a true 75 instead of silently short.
+                    "name": rec.name if rec else "Unknown card #%d" % c.mtgo_id,
+                    "mana_cost": rec.mana_cost if rec else "",
+                    "type_line": rec.type_line if rec else "",
+                    "cmc": rec.cmc if rec else 0.0,
+                    "colors": rec.color_identity if rec else "",
+                    "rarity": rec.rarity if rec else "",
+                    "set": rec.set_code if rec else "",
+                    "image": rec.image_url("normal") if rec else None,
+                    "art": rec.image_url("art_crop") if rec else None,
+                    "resolved": rec is not None,
+                })
+            rows.sort(key=lambda r: (
+                "land" in (r["type_line"] or "").lower(),
+                -r["quantity"], r["cmc"], r["name"],
+            ))
+            return rows
+
+        user = _resolve_user(user_override)
+        matches = _all_matches(None, fmt="") if user else []
+        links = _deck_links(matches, user) if user else {}
+
+        history: list[dict[str, Any]] = []
+        opponents: Counter = Counter()
+        vs: dict[str, dict[str, int]] = defaultdict(
+            lambda: {"wins": 0, "losses": 0}
+        )
+        for m in matches:
+            hit = links.get(m.match_id)
+            if hit is None or hit.deck_id != deck_id:
+                continue
+            opp = next((p for p in m.players if p != user), None)
+            if not opp:
+                continue
+            opp_arch = _classify(
+                m.cards_by_player.get(opp, []),
+                m.cards_cast_by_player.get(opp, []),
+                fmt=m.format or "Legacy",
+                player=opp,
+            )
+            won = m.match_winner == user
+            if m.match_winner:
+                vs[opp_arch]["wins" if won else "losses"] += 1
+                opponents[opp] += 1
+            history.append({
+                "match_id": m.match_id,
+                "played_at": m.log_mtime,
+                "opponent": opp,
+                "opponent_archetype": opp_arch,
+                "result": ("W" if won else "L") if m.match_winner else None,
+                # The parser records the score as the *winner* wrote it
+                # ("X wins the match 2-0"), so it must be flipped when the
+                # user lost, or their losses read as 2-0 wins.
+                "score": (
+                    ("%s-%s" % (m.score_won, m.score_lost)) if won
+                    else ("%s-%s" % (m.score_lost, m.score_won))
+                ) if m.score_won is not None else None,
+                "confidence": hit.coverage,
+                "ambiguous": hit.ambiguous,
+            })
+
+        history.sort(key=lambda r: r["played_at"] or 0, reverse=True)
+        matchups = sorted(
+            (
+                {
+                    "archetype": k,
+                    "wins": v["wins"],
+                    "losses": v["losses"],
+                    "matches": v["wins"] + v["losses"],
+                    "winrate": (v["wins"] / (v["wins"] + v["losses"]))
+                    if (v["wins"] + v["losses"]) else None,
+                }
+                for k, v in vs.items()
+            ),
+            key=lambda r: -r["matches"],
+        )
+
+        wins = sum(1 for h in history if h["result"] == "W")
+        losses = sum(1 for h in history if h["result"] == "L")
+
+        return {
+            "id": deck.deck_id,
+            "name": deck.name,
+            "format": deck.format,
+            "modified_at": deck.modified_at,
+            "maindeck": render(deck.maindeck),
+            "sideboard": render(deck.sideboard),
+            "maindeck_count": deck.maindeck_count,
+            "sideboard_count": deck.sideboard_count,
+            "wins": wins,
+            "losses": losses,
+            "winrate": (wins / (wins + losses)) if (wins + losses) else None,
+            "matchups": matchups,
+            "history": history[:100],
+            "distinct_opponents": len(opponents),
+            **_deck_summary(deck, index),
+        }
+
+    @app.post("/api/decklists/refresh-cards")
+    def refresh_card_index() -> dict[str, Any]:
+        """Re-download the Scryfall card index."""
+        try:
+            n = build_card_index(card_index_path())
+            _deck_cache["index"] = None
+            return {"ok": True, "cards": n}
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     # router owns every non-/api route, so we serve index.html as the
     # fallback for anything not found in /assets/.
     if WEB_DIST.exists() and (WEB_DIST / "index.html").exists():
