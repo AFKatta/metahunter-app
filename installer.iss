@@ -21,7 +21,7 @@
 ; Both produce dist\Metahunter-Setup-<version>.exe (see OutputBaseFilename).
 
 #define AppName        "Metahunter"
-#define AppVersion     "0.2.0"
+#define AppVersion     "0.3.0"
 #define AppPublisher   "AFKatta"
 #define AppURL         "https://metahunter-web.vercel.app"
 #define AppExe         "Metahunter.exe"

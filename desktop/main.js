@@ -42,6 +42,7 @@ let backendPort = null;
 let isQuitting = false;
 let backendExitInfo = null;
 let updateReady = false;
+let updateStatus = 'Checking for updates…';
 
 /* ------------------------------------------------------------------ */
 /* backend discovery                                                    */
@@ -202,10 +203,20 @@ function stopBackend() {
 /* auto-update                                                          */
 /* ------------------------------------------------------------------ */
 
-// How long after launch the first check runs. The app is busy starting
-// the backend and classifying on first paint; an update check competing
-// for bandwidth right then is felt by the user for no benefit.
-const UPDATE_FIRST_CHECK_MS = 45_000;
+// How long after launch the first check runs.
+//
+// This was 45s on the theory that a check would compete with startup.
+// That was over-cautious: the check is a single request for a ~200 byte
+// manifest, which costs nothing next to spawning the backend and
+// classifying a thousand matches. Waiting three quarters of a minute
+// only made the app look like it was ignoring updates.
+//
+// It cannot happen *before* the window opens, because the app is the
+// thing doing the checking — blocking startup on a network round trip
+// would trade a fast launch for a slow one, and fail badly offline. The
+// standard pattern, and what we do, is show the app immediately and
+// check right behind it.
+const UPDATE_FIRST_CHECK_MS = 3_000;
 // Long-running sessions still get updates without restarting.
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
@@ -245,7 +256,32 @@ function setupUpdater() {
     }
   });
 
+  autoUpdater.on('checking-for-update', () => {
+    updateStatus = 'Checking for updates…';
+    rebuildTrayMenu();
+  });
+
+  autoUpdater.on('update-not-available', () => {
+    // Say so. A silent updater is indistinguishable from a broken one,
+    // which is exactly the conclusion a user draws after leaving the app
+    // open overnight and seeing nothing.
+    updateStatus = `Up to date (v${app.getVersion()})`;
+    rebuildTrayMenu();
+  });
+
+  autoUpdater.on('update-available', (info) => {
+    updateStatus = `Downloading v${info.version}…`;
+    rebuildTrayMenu();
+  });
+
+  autoUpdater.on('download-progress', (p) => {
+    updateStatus = `Downloading update… ${Math.round(p.percent)}%`;
+    rebuildTrayMenu();
+  });
+
   autoUpdater.on('error', (err) => {
+    updateStatus = 'Update check failed';
+    rebuildTrayMenu();
     // A failed check must never interrupt the app. Being offline, or
     // GitHub rate-limiting, is an ordinary Tuesday.
     console.error('[updater]', err && err.message ? err.message : err);
@@ -374,6 +410,8 @@ function rebuildTrayMenu() {
 
 function buildTrayTemplate() {
   return [
+    { label: updateStatus, enabled: false },
+    { type: 'separator' },
     { label: 'Open Metahunter', click: showWindow },
     {
       label: 'Open in browser',
