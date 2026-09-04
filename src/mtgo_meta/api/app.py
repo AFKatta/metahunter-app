@@ -1119,13 +1119,35 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             "resolved_cards": resolved,
         }
 
-    def _key_cards(deck, index, limit: int = 5) -> list[dict[str, Any]]:
-        """The cards a player would recognise this deck by.
+    def _deck_card_frequency(decks: list, index) -> dict[str, int]:
+        """How many of the player's own decks contain each card."""
+        freq: dict[str, int] = defaultdict(int)
+        for d in decks:
+            seen = set()
+            for c in d.cards:
+                rec = index.get(c.mtgo_id)
+                if rec and rec.name:
+                    seen.add(rec.name)
+            for name in seen:
+                freq[name] += 1
+        return freq
 
-        Four-ofs first, then by mana value descending, so the payoff shows
-        rather than the cantrips every blue deck runs. Lands are set aside
-        unless the deck has essentially nothing else, which is how
-        land-defined decks still get a sensible face.
+    def _key_cards(
+        deck, index, freq: dict[str, int], total_decks: int, limit: int = 4,
+    ) -> list[dict[str, Any]]:
+        """The cards that make this deck recognisable at a glance.
+
+        Sorting by copies and mana value put Force of Will on every blue
+        deck, which told the reader nothing: a card in most of the
+        collection is exactly the card that cannot identify one deck
+        within it.
+
+        So score by rarity across the player's own decks instead. A card
+        in one list out of sixty-five names that list; a card in fifty
+        is wallpaper. Copies still act as a tie-break, because a
+        four-of is more defining than a singleton at equal rarity, and
+        lands are held back unless the deck is land-defined and has
+        little else to show.
         """
         rows = []
         for c in deck.maindeck:
@@ -1133,9 +1155,21 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             if rec is None or rec.is_basic_land:
                 continue
             rows.append((c.quantity, rec))
+
         nonland = [r for r in rows if not r[1].is_land]
         pool = nonland or rows
-        pool.sort(key=lambda t: (-t[0], -t[1].cmc, t[1].name))
+        if not pool:
+            return []
+
+        def distinctiveness(rec) -> float:
+            # Fraction of decks *without* this card: 0 when everyone runs
+            # it, approaching 1 when almost nobody does.
+            in_decks = freq.get(rec.name, 1)
+            return 1.0 - (in_decks / max(total_decks, 1))
+
+        pool.sort(
+            key=lambda t: (-distinctiveness(t[1]), -t[0], -t[1].cmc, t[1].name)
+        )
         return [
             {
                 "name": rec.name,
@@ -1144,6 +1178,9 @@ def create_app(db_path: Path | None = None) -> FastAPI:
                 "type_line": rec.type_line,
                 "image": rec.image_url("normal"),
                 "art": rec.image_url("art_crop"),
+                # Surfaced so the UI can pick a face that is actually
+                # specific to this deck rather than the first card.
+                "decks_with_card": freq.get(rec.name, 1),
             }
             for qty, rec in pool[:limit]
         ]
@@ -1178,6 +1215,9 @@ def create_app(db_path: Path | None = None) -> FastAPI:
                 a["ambiguous"] += 1
             a["last_played"] = max(a["last_played"], m.log_mtime or 0.0)
 
+        freq = _deck_card_frequency(decks, index)
+        total_decks = len(decks)
+
         out = []
         for d in decks:
             if fmt and d.format.lower() != fmt.lower():
@@ -1199,7 +1239,7 @@ def create_app(db_path: Path | None = None) -> FastAPI:
                 "winrate": (wins / played) if played else None,
                 "ambiguous_matches": rec["ambiguous"] if rec else 0,
                 "last_played": (rec["last_played"] or None) if rec else None,
-                "key_cards": _key_cards(d, index),
+                "key_cards": _key_cards(d, index, freq, total_decks),
                 **_deck_summary(d, index),
             })
 

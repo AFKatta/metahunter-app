@@ -36,6 +36,9 @@ export function Decks() {
   const [sort, setSort] = useState<SortKey>("recent")
   const [query, setQuery] = useState("")
   const [format, setFormat] = useState<string>("all")
+  // 65 saved decks with 55 played means ten dead tiles between the
+  // ones you care about. Hidden by default, one click to see them.
+  const [showUnplayed, setShowUnplayed] = useState(false)
 
   const decks = useQuery({
     queryKey: ["decklists", account],
@@ -50,6 +53,7 @@ export function Decks() {
 
   const rows = useMemo(() => {
     let list = decks.data?.decks ?? []
+    if (!showUnplayed) list = list.filter((d) => d.matches > 0)
     if (format !== "all") list = list.filter((d) => d.format === format)
     const q = query.trim().toLowerCase()
     if (q) list = list.filter((d) => d.name.toLowerCase().includes(q))
@@ -73,7 +77,7 @@ export function Decks() {
       }
     })
     return sorted
-  }, [decks.data, sort, query, format])
+  }, [decks.data, sort, query, format, showUnplayed])
 
   const played = (decks.data?.decks ?? []).filter((d) => d.matches > 0).length
 
@@ -124,6 +128,16 @@ export function Decks() {
             ))}
           </select>
         )}
+        <label className="flex cursor-pointer select-none items-center gap-2 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={showUnplayed}
+            onChange={(e) => setShowUnplayed(e.target.checked)}
+            className="size-3.5 accent-current"
+          />
+          Show unplayed
+        </label>
+
         <div className="ml-auto text-xs text-muted-foreground">
           {decks.data && (
             <>
