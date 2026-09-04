@@ -169,8 +169,6 @@ export type DecklistRow = {
   losses: number
   matches: number
   winrate: number | null
-  /** Matches that fit several near-identical decks equally well. */
-  ambiguous_matches: number
   last_played: number | null
   key_cards: KeyCard[]
   curve: Record<string, number>
@@ -180,8 +178,13 @@ export type DecklistRow = {
 export type DecklistsResponse = {
   decks: DecklistRow[]
   card_index_size: number
+  /** The Scryfall card index is downloading; names are incomplete. */
+  card_index_building: boolean
+  /** Matches MTGO itself recorded a registered deck for. */
   attributed_matches: number
   total_matches: number
+  /** Friendly games dropped before any of these numbers were computed. */
+  excluded_friendly: number
 }
 
 export type DeckMatchup = {
@@ -199,8 +202,31 @@ export type DeckHistoryRow = {
   opponent_archetype: string
   result: "W" | "L" | null
   score: string | null
-  confidence: number
-  ambiguous: boolean
+  /** "league" | "tournament" | "casual" | "unknown", as MTGO recorded it. */
+  event_kind: string
+}
+
+/** One rung of the 5-0 … 0-5 league ladder. */
+export type LeagueRung = {
+  record: string
+  wins: number
+  runs: number
+}
+
+export type LeagueSummary = {
+  ladder: LeagueRung[]
+  completed_runs: number
+  trophies: number
+  in_progress: {
+    wins: number
+    losses: number
+    matches: number
+    started_at: number | null
+  } | null
+  average_wins: number | null
+  league_matches: number
+  /** Entries that stopped short of five matches and are not scored. */
+  abandoned_runs: number
 }
 
 export type DecklistDetail = {
@@ -218,6 +244,7 @@ export type DecklistDetail = {
   winrate: number | null
   matchups: DeckMatchup[]
   history: DeckHistoryRow[]
+  leagues: LeagueSummary
   distinct_opponents: number
   curve: Record<string, number>
   resolved_cards: number

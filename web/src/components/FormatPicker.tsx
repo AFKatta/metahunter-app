@@ -1,5 +1,5 @@
-import { useQuery } from "@tanstack/react-query"
 import { api } from "@/lib/api"
+import { usePersistedQuery } from "@/lib/persist"
 import { useFormat } from "@/components/FormatProvider"
 import { useAccount } from "@/components/AccountProvider"
 import { cn } from "@/lib/utils"
@@ -14,7 +14,7 @@ import { cn } from "@/lib/utils"
 export function FormatPicker() {
   const { format, setFormat } = useFormat()
   const { account } = useAccount()
-  const { data, isLoading } = useQuery({
+  const { data, isLoading } = usePersistedQuery({
     // Re-query when the user switches account — the friend's account
     // may have a different set of formats from yours.
     queryKey: ["formats", account],

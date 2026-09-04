@@ -52,6 +52,18 @@ CREATE TABLE IF NOT EXISTS logs (
     ingested_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS registered_decks (
+    game_id       TEXT PRIMARY KEY,   -- MTGO's numeric game id
+    match_uuid    TEXT,               -- links to Match_GameLog_<uuid>.dat
+    username      TEXT NOT NULL,
+    signature     TEXT NOT NULL,      -- catalog:qty:sideboard, sorted
+    cards_json    TEXT NOT NULL,      -- [[catalog, qty, sideboard], ...]
+    is_league     INTEGER,            -- 1 league, 0 friendly, NULL unknown
+    event_kind    TEXT,               -- league / tournament / casual
+    captured_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_regdecks_match ON registered_decks(match_uuid);
+
 CREATE TABLE IF NOT EXISTS matches (
     match_id      TEXT PRIMARY KEY,
     log_path      TEXT NOT NULL,
@@ -194,6 +206,108 @@ class MatchStore:
 
 # Mirrors the matches row. Kept lightweight (not a Pydantic model) so
 # the store has no heavy deps.
+
+    # ---- registered decks (captured from MTGO's text log) ---------------
+
+    def upsert_registered_deck(
+        self,
+        game_id: str,
+        username: str,
+        signature: str,
+        cards: list,
+        match_uuid: str | None = None,
+        is_league: bool | None = None,
+        event_kind: str | None = None,
+    ) -> None:
+        """Record which list was registered for one game.
+
+        Idempotent by game id. Fields that arrive later — the match uuid
+        and event kind often appear in a different part of the log than
+        the decklist — are filled in without clobbering what is already
+        stored, so a second pass can only add information.
+        """
+        import json as _json
+        import time as _time
+
+        self.conn.execute(
+            "INSERT INTO registered_decks"
+            " (game_id, match_uuid, username, signature, cards_json,"
+            "  is_league, event_kind, captured_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(game_id) DO UPDATE SET"
+            "   match_uuid = COALESCE(excluded.match_uuid, registered_decks.match_uuid),"
+            "   is_league  = COALESCE(excluded.is_league,  registered_decks.is_league),"
+            "   event_kind = COALESCE(excluded.event_kind, registered_decks.event_kind)",
+            (
+                str(game_id),
+                match_uuid,
+                username,
+                signature,
+                _json.dumps(cards),
+                None if is_league is None else int(is_league),
+                event_kind,
+                _time.time(),
+            ),
+        )
+        self.conn.commit()
+
+    def registered_decks(self) -> list[dict]:
+        """Every captured registration, newest first."""
+        import json as _json
+
+        rows = self.conn.execute(
+            "SELECT game_id, match_uuid, username, signature, cards_json,"
+            "       is_league, event_kind, captured_at"
+            "  FROM registered_decks ORDER BY captured_at DESC"
+        ).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "game_id": r[0],
+                "match_uuid": r[1],
+                "username": r[2],
+                "signature": r[3],
+                "cards": _json.loads(r[4]),
+                "is_league": None if r[5] is None else bool(r[5]),
+                "event_kind": r[6],
+                "captured_at": r[7],
+            })
+        return out
+
+    def registered_by_match(self) -> dict:
+        """match uuid -> registration, for matches we have one for."""
+        return {
+            r["match_uuid"]: r
+            for r in self.registered_decks()
+            if r["match_uuid"]
+        }
+
+    def fingerprint(self) -> tuple:
+        """A value that changes whenever the stored data does.
+
+        The API derives several expensive tables from this store and
+        holds them for the life of the process. That was fine when the
+        store only changed between runs, but the log watcher now writes
+        while the app is open — a deck registered mid-session must show
+        up without a restart. Callers cache against this instead of
+        caching forever.
+
+        Counts plus the newest timestamps are enough: rows are only ever
+        inserted or updated in place, never deleted, so either the count
+        moves or a timestamp does. Both queries hit indexed columns and
+        cost microseconds, which is what makes it safe to call on every
+        request.
+        """
+        m = self.conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(parsed_at), 0) FROM matches"
+        ).fetchone()
+        r = self.conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(captured_at), 0)"
+            "  FROM registered_decks"
+        ).fetchone()
+        return (m[0], m[1], r[0], r[1])
+
+
 class StoredMatch:
     __slots__ = (
         "match_id", "log_path", "log_mtime", "players_json", "first_player",

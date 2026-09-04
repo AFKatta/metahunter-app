@@ -1,5 +1,5 @@
-import { useQuery } from "@tanstack/react-query"
 import { api } from "@/lib/api"
+import { usePersistedQuery } from "@/lib/persist"
 import { useAccount } from "@/components/AccountProvider"
 import { cn } from "@/lib/utils"
 
@@ -9,7 +9,7 @@ import { cn } from "@/lib/utils"
  *  filtering out frequent opponents who'd otherwise show up. */
 export function AccountPicker() {
   const { account, setAccount } = useAccount()
-  const { data, isLoading } = useQuery({
+  const { data, isLoading } = usePersistedQuery({
     queryKey: ["accounts"],
     queryFn: api.accounts,
     staleTime: 60_000,

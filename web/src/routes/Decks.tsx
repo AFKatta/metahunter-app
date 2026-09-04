@@ -1,8 +1,9 @@
 import { useMemo, useState } from "react"
-import { useQuery } from "@tanstack/react-query"
 import { Link } from "react-router-dom"
 import { api, type DecklistRow } from "@/lib/api"
+import { usePersistedQuery } from "@/lib/persist"
 import { useAccount } from "@/components/AccountProvider"
+import { ManaCost } from "@/components/ManaCost"
 import { ago, pct, record, winrateColor } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
@@ -13,23 +14,16 @@ import { cn } from "@/lib/utils"
  * as you edit, so these are your real lists rather than something
  * reconstructed from cards seen in play.
  *
- * Match records are a different matter and the page is careful about
- * saying so. MTGO only records which deck you registered in its rolling
- * text log, which the app does not read yet, so a match is attributed by
- * comparing the cards you cast against each saved list. That cannot
- * separate near-identical variants of one shell, so a record built
- * mostly from ties is flagged rather than presented as fact.
+ * Records are held to a stricter standard. Comparing cast cards against
+ * each saved list could attribute far more matches, but it cannot tell
+ * two variants of one shell apart, so a win rate built that way is
+ * partly guesswork wearing a decimal point. Instead a match counts only
+ * when MTGO's own log named the deck registered for it — which means
+ * fewer numbers here, all of them true. Friendly games are excluded
+ * everywhere in the app and never reach these figures.
  */
 
 type SortKey = "recent" | "played" | "winrate" | "name"
-
-const MANA: Record<string, string> = {
-  W: "bg-amber-100 text-amber-900",
-  U: "bg-sky-300 text-sky-950",
-  B: "bg-neutral-700 text-neutral-100",
-  R: "bg-red-400 text-red-950",
-  G: "bg-emerald-400 text-emerald-950",
-}
 
 export function Decks() {
   const { account } = useAccount()
@@ -40,7 +34,10 @@ export function Decks() {
   // ones you care about. Hidden by default, one click to see them.
   const [showUnplayed, setShowUnplayed] = useState(false)
 
-  const decks = useQuery({
+  // Persisted: the grid paints from the last known answer the instant
+  // the page opens, then refreshes in the background. Re-reading 65
+  // deck files on every launch is not a reason to show skeletons.
+  const decks = usePersistedQuery({
     queryKey: ["decklists", account],
     queryFn: () => api.decklists({ user: account || undefined }),
     staleTime: 30_000,
@@ -138,15 +135,34 @@ export function Decks() {
           Show unplayed
         </label>
 
-        <div className="ml-auto text-xs text-muted-foreground">
+        <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
+          {decks.fromCache && (
+            <span
+              className="size-1.5 animate-pulse rounded-full bg-muted-foreground/60"
+              title="Refreshing from your MTGO folder"
+            />
+          )}
           {decks.data && (
-            <>
+            <span
+              title={
+                `${decks.data.excluded_friendly.toLocaleString()} friendly ` +
+                "games were excluded before these records were computed."
+              }
+            >
               {decks.data.attributed_matches.toLocaleString()} of{" "}
-              {decks.data.total_matches.toLocaleString()} matches matched to a deck
-            </>
+              {decks.data.total_matches.toLocaleString()} matches confirmed to a deck
+            </span>
           )}
         </div>
       </div>
+
+      {decks.data?.card_index_building && (
+        <p className="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">
+          Downloading the card database from Scryfall. Card names and
+          images fill in once it finishes — this happens on first run and
+          about once a week after that.
+        </p>
+      )}
 
       {decks.isLoading && <SkeletonGrid />}
 
@@ -178,8 +194,6 @@ export function Decks() {
 
 function DeckCard({ deck }: { deck: DecklistRow }) {
   const face = deck.key_cards.find((c) => c.art) ?? deck.key_cards[0]
-  const mostlyGuessed =
-    deck.matches > 0 && deck.ambiguous_matches / deck.matches > 0.5
 
   return (
     <Link
@@ -203,19 +217,13 @@ function DeckCard({ deck }: { deck: DecklistRow }) {
           <div className="h-full w-full bg-gradient-to-br from-muted to-background" />
         )}
         <div className="absolute inset-0 bg-gradient-to-t from-card via-card/60 to-transparent" />
-        <div className="absolute right-2 top-2 flex gap-1">
-          {deck.colors.split("").map((c) => (
-            <span
-              key={c}
-              title={c}
-              className={cn(
-                "grid size-5 place-items-center rounded-full text-[10px] font-bold",
-                MANA[c] ?? "bg-neutral-500 text-white"
-              )}
-            >
-              {c}
-            </span>
-          ))}
+        <div className="absolute right-2 top-2">
+          {/* Colour identity in the same symbols the decklist uses, so
+              the two pages read the same way. */}
+          <ManaCost
+            cost={deck.colors.split("").map((c) => `{${c}}`).join("")}
+            size={18}
+          />
         </div>
       </div>
 
@@ -269,15 +277,6 @@ function DeckCard({ deck }: { deck: DecklistRow }) {
             )}
           </div>
         </div>
-
-        {mostlyGuessed && (
-          <p
-            className="text-[10px] leading-tight text-amber-500/80"
-            title="These matches also fit other near-identical saved decks, so the record is an estimate."
-          >
-            record shared with similar lists
-          </p>
-        )}
       </div>
     </Link>
   )

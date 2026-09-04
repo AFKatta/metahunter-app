@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react"
-import { useQuery } from "@tanstack/react-query"
 import { useNavigate, useSearchParams } from "react-router-dom"
 import { api } from "@/lib/api"
+import { usePersistedQuery } from "@/lib/persist"
 import { ago } from "@/lib/format"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
@@ -52,7 +52,9 @@ export function Matches() {
     setParams(next, { replace: true })
   }
 
-  const q = useQuery({
+  // Persisted: reopening the app should show the last page of
+  // matches immediately and correct it behind you.
+  const q = usePersistedQuery({
     queryKey: ["matches", rkey, yourDeck, theirDeck, opponent, page],
     queryFn: () =>
       api.matches({

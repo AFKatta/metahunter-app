@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react"
-import { useQuery } from "@tanstack/react-query"
 import {
   Area,
   Bar,
@@ -12,6 +11,7 @@ import {
   YAxis,
 } from "recharts"
 import { api, type RangeParams, type TimelineRow } from "@/lib/api"
+import { usePersistedQuery } from "@/lib/persist"
 import { pct } from "@/lib/format"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
@@ -60,7 +60,7 @@ export function Timeline({
   // its own timeline.
   const { format } = useFormat()
   const { account } = useAccount()
-  const q = useQuery({
+  const q = usePersistedQuery({
     queryKey: ["timeline-all", format, account],
     queryFn: () => api.timeline({ format, user: account || undefined }),
   })

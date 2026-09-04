@@ -1,6 +1,6 @@
 import { useState } from "react"
-import { useQuery } from "@tanstack/react-query"
 import { api } from "@/lib/api"
+import { usePersistedQuery } from "@/lib/persist"
 import { ago, pct, record, winrateColor } from "@/lib/format"
 import { HeroStat, pickWinRateTone } from "@/components/HeroStat"
 import { cn } from "@/lib/utils"
@@ -33,9 +33,13 @@ export function Overview() {
   const params = { ...rangeToParams(range), format, user: account || undefined }
   const key = `${rangeKey(range)}|${format}|${account}`
 
-  const me = useQuery({ queryKey: ["me", key], queryFn: () => api.me(params) })
-  const decks = useQuery({ queryKey: ["decks", key], queryFn: () => api.decks(params) })
-  const opps = useQuery({ queryKey: ["opponents", key], queryFn: () => api.opponents(params) })
+  // Persisted so the landing page opens on last session's figures and
+  // corrects itself a moment later, rather than on a row of skeletons.
+  // Classifying a long history takes seconds and the answer barely
+  // moves between launches.
+  const me = usePersistedQuery({ queryKey: ["me", key], queryFn: () => api.me(params) })
+  const decks = usePersistedQuery({ queryKey: ["decks", key], queryFn: () => api.decks(params) })
+  const opps = usePersistedQuery({ queryKey: ["opponents", key], queryFn: () => api.opponents(params) })
 
   const matchWR = me.data?.match_winrate ?? null
   const gameWR = me.data?.game_winrate ?? null

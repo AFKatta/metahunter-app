@@ -11,4 +11,4 @@ Bump per release:
           that requires a re-ingest, etc.)
 """
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"

@@ -38,6 +38,7 @@ from mtgo_meta.api.app import create_app
 from mtgo_meta.config import find_mtgo_appfiles_dirs
 from mtgo_meta.ingest import ingest_all
 from metahunter_core.parser import parse_game_log
+from metahunter_core.text_log import find_log_files, parse_text_log
 from mtgo_meta.paths import default_db_path, is_frozen, user_data_dir, web_dist_dir
 from mtgo_meta.store import MatchStore
 
@@ -100,6 +101,90 @@ class _LogHandler(FileSystemEventHandler):
             print(f"  watcher error on {path.name}: {e}", file=sys.stderr)
 
 
+class _TextLogPoller(threading.Thread):
+    """Reads MTGO's running text log for deck registrations.
+
+    The decklist a player registers is written to that log and nowhere
+    else, and MTGO rotates the file, so anything not captured while the
+    app is open is gone. Polling rather than watching: the log is
+    appended to constantly during play, and a filesystem event per write
+    would be far noisier than simply looking every few seconds.
+
+    Only files whose size has changed are re-read, so a steady state
+    costs one stat() per file per tick.
+    """
+
+    #: MTGO appends continuously; this is often enough to catch a
+    #: registration well within the game it belongs to.
+    INTERVAL_SECONDS = 15.0
+
+    def __init__(self, db_path: Path) -> None:
+        super().__init__(name="metahunter-textlog", daemon=True)
+        self.db_path = db_path
+        self._stop = threading.Event()
+        self._sizes: dict[str, int] = {}
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        # A first pass on startup picks up anything written while the
+        # app was closed but before MTGO rotated the log.
+        self._tick(first=True)
+        while not self._stop.wait(self.INTERVAL_SECONDS):
+            try:
+                self._tick()
+            except Exception as e:  # noqa: BLE001
+                print(f"  textlog: {e}", file=sys.stderr)
+
+    def _tick(self, first: bool = False) -> None:
+        changed = []
+        for p in find_log_files():
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            if self._sizes.get(str(p)) != size:
+                self._sizes[str(p)] = size
+                changed.append(p)
+        if not changed:
+            return
+
+        facts = None
+        for p in changed:
+            facts = parse_text_log(p, facts)
+        if facts is None or not facts.decks_by_game:
+            return
+
+        stored = 0
+        conn = sqlite3.connect(self.db_path)
+        try:
+            store = MatchStore(conn)
+            for game_id, rd in facts.decks_by_game.items():
+                match_uuid = facts.match_by_game.get(game_id)
+                store.upsert_registered_deck(
+                    game_id=game_id,
+                    username=rd.username,
+                    signature=rd.signature(),
+                    cards=[list(c) for c in rd.cards],
+                    match_uuid=match_uuid,
+                    is_league=facts.league_by_game.get(game_id),
+                    event_kind=(
+                        facts.event_for_match(match_uuid) if match_uuid else None
+                    ),
+                )
+                stored += 1
+        finally:
+            conn.close()
+
+        if stored and not first:
+            print(
+                f"[{time.strftime('%H:%M:%S')}] captured {stored} deck "
+                f"registration(s) from MTGO's log",
+                flush=True,
+            )
+
+
 def _start_watcher(db_path: Path) -> Observer | None:
     folders = find_mtgo_appfiles_dirs()
     if not folders:
@@ -113,6 +198,13 @@ def _start_watcher(db_path: Path) -> Observer | None:
         print(f"  watcher: live on {folder}")
     obs.daemon = True
     obs.start()
+
+    # Deck registrations live in MTGO's text log, not the .dat files the
+    # observer above watches, so they need their own reader.
+    poller = _TextLogPoller(db_path)
+    poller.start()
+    print("  watcher: reading MTGO text log for deck registrations")
+
     return obs
 
 

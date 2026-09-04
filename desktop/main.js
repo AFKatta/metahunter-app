@@ -7,14 +7,16 @@
  * work happens in the Python backend, which serves both the API and the
  * built React UI. This process:
  *
- *   1. picks a free TCP port,
+ *   1. picks a TCP port, preferring the same one every launch,
  *   2. spawns the backend bound to it with the browser-opening disabled,
  *   3. waits for /api/health to answer,
  *   4. points a BrowserWindow at it.
  *
  * The port is chosen here rather than by the backend so we always know
  * where to connect; the backend's own port-scanning fallback stays for
- * people running it standalone from a terminal.
+ * people running it standalone from a terminal. Keeping the port stable
+ * matters more than it looks: it is what makes the window's origin
+ * stable, and therefore what lets the UI keep a cache between runs.
  */
 
 const { app, BrowserWindow, Tray, Menu, shell, dialog, nativeImage, nativeTheme } = require('electron');
@@ -81,18 +83,36 @@ function resolveBackend() {
   return fromBuild || fromSource;
 }
 
-function findFreePort() {
-  return new Promise((resolve, reject) => {
+// The window is served from http://127.0.0.1:<port>, and the browser
+// scopes localStorage to that origin. A different port each launch
+// therefore means a different origin, an empty cache, and the UI
+// rebuilding everything from scratch every single time. So we ask for
+// the same port every run and only wander if something else holds it.
+const PREFERRED_PORTS = [8765, 8766, 8767, 8768, 8769];
+
+function tryPort(port) {
+  return new Promise((resolve) => {
     const srv = net.createServer();
     srv.unref();
-    srv.on('error', reject);
-    // Port 0 lets the OS hand us one that is definitely free, which
-    // avoids the race a fixed-range scan has between check and bind.
-    srv.listen(0, '127.0.0.1', () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
+    srv.on('error', () => resolve(null));
+    srv.listen(port, '127.0.0.1', () => {
+      const actual = srv.address().port;
+      srv.close(() => resolve(actual));
     });
   });
+}
+
+async function findFreePort() {
+  for (const p of PREFERRED_PORTS) {
+    const got = await tryPort(p);
+    if (got) return got;
+  }
+  // Everything preferred is taken. Port 0 lets the OS pick one that is
+  // definitely free — the cache is cold this run, which beats not
+  // starting at all.
+  const any = await tryPort(0);
+  if (any) return any;
+  throw new Error('no free port available on 127.0.0.1');
 }
 
 function waitForHealth(port, timeoutMs) {
@@ -454,6 +474,24 @@ function createTray() {
 /* ------------------------------------------------------------------ */
 
 if (!app.requestSingleInstanceLock()) {
+  // Someone already holds the lock. In a packaged build that is the
+  // right outcome: the running window gets focused and this copy exits
+  // quietly, which is what a user double-clicking the icon expects.
+  //
+  // In development it is a trap. `npm start` appears to do nothing at
+  // all - no window, no error, no output - because the *installed*
+  // Metahunter is already running and owns the lock, so you sit there
+  // wondering why your changes had no effect. Say so instead.
+  if (!app.isPackaged) {
+    dialog.showErrorBox(
+      'Metahunter is already running',
+      'Another copy already holds the single-instance lock, so this one '
+      + 'exited without opening a window.' + '\\n\\n'
+      + 'That is almost always the installed Metahunter. Quit it from '
+      + 'its tray icon, then run npm start again - otherwise you are '
+      + 'looking at the installed build, not your source changes.'
+    );
+  }
   app.quit();
 } else {
   app.on('second-instance', showWindow);

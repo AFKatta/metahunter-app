@@ -9,6 +9,8 @@ the fly per request and is cached per process via a small LRU.
 from __future__ import annotations
 
 import json
+import logging
+import threading
 import time
 from collections import Counter, defaultdict
 from functools import lru_cache
@@ -21,8 +23,12 @@ from fastapi.staticfiles import StaticFiles
 
 from metahunter_core.card_index import CardIndex
 from metahunter_core.card_index import build_index as build_card_index
-from metahunter_core.deck_files import load_decks
-from metahunter_core.deck_matching import link_matches
+from metahunter_core.deck_files import load_decks, mtgo_history_files
+from metahunter_core.event_kind import (
+    CASUAL,
+    LEAGUE,
+    resolve as resolve_event_kind,
+)
 from metahunter_core.player_index import (
     MIN_CONSISTENCY,
     build_player_index,
@@ -49,6 +55,8 @@ from mtgo_meta.paths import (
     web_dist_dir,
 )
 from mtgo_meta.store import open_store
+
+log = logging.getLogger(__name__)
 
 FORMAT_DATA = format_data_dir()
 DEFAULT_DB = default_db_path()
@@ -400,11 +408,112 @@ def create_app(db_path: Path | None = None) -> FastAPI:
                 labels[m.match_id] = consensus
         return labels
 
+    # Shared cache for the derived tables below: saved decks, the card
+    # index, exact deck links and event kinds. All are expensive to
+    # rebuild and none change within a request.
+    _deck_cache: dict[str, Any] = {
+        "decks": None, "at": 0.0, "links": None, "index": None,
+        "casual_ids": None, "event_kinds": None, "registered": None,
+        "exact_links": None, "fingerprint": None,
+    }
+
+    # Everything above except the card index is derived from the match
+    # store, so all of it has to go when the store moves.
+    _STORE_DERIVED = ("casual_ids", "event_kinds", "registered",
+                      "exact_links", "links")
+
+    def _sync_cache() -> None:
+        """Drop store-derived caches when the store has changed.
+
+        The log watcher writes while the app is running: a deck the
+        player registers mid-session must appear without a restart,
+        which a process-lifetime cache would prevent. The fingerprint
+        query is two indexed COUNT/MAX reads, cheap enough to run on
+        every request.
+        """
+        try:
+            with open_store(db) as st:
+                fp = st.fingerprint()
+        except Exception:  # noqa: BLE001
+            return  # store unreadable; keep whatever we already had
+        if fp == _deck_cache.get("fingerprint"):
+            return
+        _deck_cache["fingerprint"] = fp
+        for k in _STORE_DERIVED:
+            _deck_cache[k] = None
+
+    def _casual_match_ids() -> set[str]:
+        """Match ids MTGO positively identifies as friendly games.
+
+        Two sources, neither complete: the text log's ``League Set``
+        flag and the history file's event blurb. A match is only listed
+        here when one of them actually says it was casual — never on
+        absence of evidence.
+
+        Computed once per process. It reads the store directly rather
+        than through ``_all_matches``, which would recurse.
+        """
+        cached = _deck_cache.get("casual_ids")
+        if cached is not None:
+            return cached
+
+        import bisect
+
+        import metahunter_core.parser.game_history as _gh
+
+        recs: list[tuple[float, str]] = []
+        try:
+            for h in mtgo_history_files():
+                p = _gh._Parser(h.read_bytes())
+                try:
+                    p.parse()
+                except Exception:  # noqa: BLE001
+                    pass
+                recs += p.matches
+        except Exception:  # noqa: BLE001
+            recs = []
+        recs.sort()
+        starts = [r[0] for r in recs]
+
+        def blurb_for(mtime: float | None) -> str | None:
+            if mtime is None or not recs:
+                return None
+            k = bisect.bisect_left(starts, mtime)
+            best, best_delta = None, 7200.0
+            for x in (k - 1, k, k + 1):
+                if 0 <= x < len(recs):
+                    delta = abs(recs[x][0] - mtime)
+                    if delta < best_delta:
+                        best, best_delta = recs[x][1], delta
+            return best
+
+        try:
+            with open_store(db) as st:
+                registered = st.registered_by_match()
+                rows = st.iter_matches()
+        except Exception:  # noqa: BLE001
+            _deck_cache["casual_ids"] = set()
+            return set()
+
+        out: set[str] = set()
+        for m in rows:
+            rd = registered.get(m.match_id) or {}
+            kind = resolve_event_kind(
+                text_log_kind=rd.get("event_kind"),
+                league_flag=rd.get("is_league"),
+                description=blurb_for(getattr(m, "log_mtime", None)),
+            )
+            if kind == CASUAL:
+                out.add(m.match_id)
+        _deck_cache["casual_ids"] = out
+        return out
+
     def _all_matches(
         days: int | None,
         from_ts: float | None = None,
         to_ts: float | None = None,
         fmt: str = "Legacy",
+        include_friendly: bool = False,
     ) -> list:
         """Pull matches from the store, scoped to one MTG format.
 
@@ -419,6 +528,10 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         Old rows that pre-date format detection have format=NULL; we
         treat those as Legacy by default since the corpus is Legacy.
         """
+        # Every endpoint reaches the store through here, which makes it
+        # the one place that has to notice the watcher writing new rows.
+        _sync_cache()
+
         cutoff_low: float | None = None
         if from_ts is not None:
             cutoff_low = from_ts
@@ -432,6 +545,22 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             # NULL format (legacy data from older parser versions) is
             # treated as the default ("Legacy").
             rows = [r for r in rows if (r.format or "Legacy") == fmt]
+
+        # Friendly games never count, anywhere. Someone testing a brew or
+        # conceding a practice game after one look at the board is not
+        # evidence about anything, and folding those in makes every
+        # figure slightly wrong in a direction no one can see.
+        #
+        # Filtered here rather than per-endpoint so a future caller
+        # cannot forget: this is the only route to the match store.
+        # Only matches MTGO positively identifies as casual are dropped;
+        # an unknown event type is kept, since most of a long history
+        # predates any record of what it was.
+        if include_friendly:
+            return rows
+        casual = _casual_match_ids()
+        if casual:
+            rows = [r for r in rows if r.match_id not in casual]
         return rows
 
     @lru_cache(maxsize=1)
@@ -1059,14 +1188,49 @@ def create_app(db_path: Path | None = None) -> FastAPI:
     # near-identical variants of the same shell, and the response says so
     # rather than quietly picking one.
 
-    _deck_cache: dict[str, Any] = {"decks": None, "at": 0.0, "links": None,
-                                   "index": None}
+
+
+    def _build_card_index_worker() -> None:
+        """Download and write the Scryfall index. Runs off the request."""
+        try:
+            n = build_card_index(card_index_path())
+            log.info("card index rebuilt: %s cards", f"{n:,}")
+        except Exception as exc:  # noqa: BLE001
+            # A failed download must not take the app down or retry in a
+            # tight loop; the next start tries again.
+            log.warning("card index build failed: %s", exc)
+        finally:
+            _deck_cache["index"] = None
+            _deck_cache["index_building"] = False
 
     def _card_index():
-        """Scryfall index, loaded once per process."""
-        if _deck_cache.get("index") is None:
-            _deck_cache["index"] = CardIndex.load(card_index_path())
-        return _deck_cache["index"]
+        """Scryfall index, loaded once per process.
+
+        Builds it in the background when it is missing, stale, or from
+        an older index format. This has to be automatic: without it a
+        fresh install shows every card as an unresolved catalog number
+        until someone finds the refresh button, and a set released after
+        the index was built never resolves at all.
+
+        The build is a 74 MB download, so it never happens inline — the
+        request returns whatever index exists now (possibly empty) and
+        the next one picks up the result.
+        """
+        index = _deck_cache.get("index")
+        if index is None:
+            index = CardIndex.load(card_index_path())
+            _deck_cache["index"] = index
+
+        if (len(index) == 0 or index.is_stale) and not _deck_cache.get(
+            "index_building"
+        ):
+            _deck_cache["index_building"] = True
+            threading.Thread(
+                target=_build_card_index_worker,
+                name="card-index-build",
+                daemon=True,
+            ).start()
+        return index
 
     def _saved_decks(force: bool = False) -> list:
         """Saved decks, re-read at most every 30 seconds.
@@ -1082,23 +1246,229 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             except Exception:  # noqa: BLE001
                 _deck_cache["decks"] = []
             _deck_cache["at"] = now
+            # Both link tables are keyed by deck contents, so an edit
+            # that changes a maindeck invalidates them too.
             _deck_cache["links"] = None
+            _deck_cache["exact_links"] = None
         return _deck_cache["decks"] or []
 
-    def _deck_links(matches: list, user: str) -> dict:
-        if _deck_cache.get("links") is None:
+    def _match_event_kinds() -> dict[str, str]:
+        """match id -> league / tournament / casual / unknown.
+
+        Two sources, neither complete: MTGO's text log (exact, but the
+        log rotates) and the history file's event blurb (wider, but
+        pruned). Combined so a match is only called friendly when one of
+        them actually says so.
+        """
+        cached = _deck_cache.get("event_kinds")
+        if cached is not None:
+            return cached
+
+        import bisect
+
+        import metahunter_core.parser.game_history as _gh
+
+        # Event blurbs, by match start time.
+        recs: list[tuple[float, str]] = []
+        try:
+            for h in mtgo_history_files():
+                p = _gh._Parser(h.read_bytes())
+                try:
+                    p.parse()
+                except Exception:  # noqa: BLE001
+                    pass
+                recs += p.matches
+        except Exception:  # noqa: BLE001
+            recs = []
+        recs.sort()
+        starts = [r[0] for r in recs]
+
+        def blurb_for(mtime: float | None) -> str | None:
+            # The log's mtime lands within a couple of hours of the
+            # match start, so the nearest record inside that window is
+            # the right one.
+            if mtime is None or not recs:
+                return None
+            k = bisect.bisect_left(starts, mtime)
+            best, best_delta = None, 7200.0
+            for x in (k - 1, k, k + 1):
+                if 0 <= x < len(recs):
+                    delta = abs(recs[x][0] - mtime)
+                    if delta < best_delta:
+                        best, best_delta = recs[x][1], delta
+            return best
+
+        try:
+            with open_store(db) as st:
+                registered = st.registered_by_match()
+        except Exception:  # noqa: BLE001
+            registered = {}
+
+        out: dict[str, str] = {}
+        for m in _all_matches(None, fmt=""):
+            rd = registered.get(m.match_id) or {}
+            out[m.match_id] = resolve_event_kind(
+                text_log_kind=rd.get("event_kind"),
+                league_flag=rd.get("is_league"),
+                description=blurb_for(getattr(m, "log_mtime", None)),
+            )
+        _deck_cache["event_kinds"] = out
+        return out
+
+    def _registered_by_match() -> dict:
+        """Captured deck registrations, keyed by match id."""
+        if _deck_cache.get("registered") is None:
             try:
-                _deck_cache["links"] = link_matches(
-                    matches, _saved_decks(), _card_index(), user
-                )
+                with open_store(db) as st:
+                    _deck_cache["registered"] = st.registered_by_match()
             except Exception:  # noqa: BLE001
-                _deck_cache["links"] = {}
-        return _deck_cache["links"] or {}
+                _deck_cache["registered"] = {}
+        return _deck_cache["registered"] or {}
+
+    def _exact_deck_links() -> dict[str, str]:
+        """match id -> saved deck id, only where MTGO told us.
+
+        Signatures are compared on the maindeck alone. A player edits
+        the sideboard between rounds of the same league run, which
+        rewrites the saved file, so demanding all 75 match would reject
+        the very games we most want to attribute.
+        """
+        if _deck_cache.get("exact_links") is not None:
+            return _deck_cache["exact_links"]
+
+        decks = _saved_decks()
+        by_main: dict[str, str] = {}
+        for d in decks:
+            key = "|".join(sorted(
+                f"{c.mtgo_id}:{c.quantity}" for c in d.maindeck
+            ))
+            # First writer wins; identical maindecks are the same deck
+            # for our purposes even under different names.
+            by_main.setdefault(key, d.deck_id)
+
+        links: dict[str, str] = {}
+        for match_id, rd in _registered_by_match().items():
+            key = "|".join(sorted(
+                f"{cid}:{qty}" for cid, qty, side in rd["cards"] if not side
+            ))
+            deck_id = by_main.get(key)
+            if deck_id:
+                links[match_id] = deck_id
+        _deck_cache["exact_links"] = links
+        return links
+
+    # An MTGO constructed league entry is five matches, played in any
+    # order over as long as the player likes, with no elimination — so
+    # every record from 5-0 down to 0-5 is reachable.
+    LEAGUE_RUN_LENGTH = 5
+
+    # A league entry is played out over days, not weeks. A longer silence
+    # than this between two league matches on one deck is a new entry,
+    # not the same one resumed — see _league_runs.
+    LEAGUE_RUN_GAP_SECONDS = 10 * 24 * 3600
+
+    def _league_runs(history: list[dict[str, Any]]) -> dict[str, Any]:
+        """Split a deck's league matches into entries and score each one.
+
+        MTGO never writes league standings to any file we can read — only
+        the client's *requests* for them appear in the log — so an entry
+        has to be rebuilt from its matches. Two rules do it:
+
+        * A gap of more than ten days starts a new entry. Without this a
+          run from October and a run from December would be welded into
+          one imaginary 5-0.
+        * Within a stretch of play, matches go five to an entry in the
+          order they happened. MTGO does not let one deck hold two
+          concurrent entries in the same league, so the sequence is
+          unambiguous as long as no match is missing.
+
+        A group of fewer than five is a run still open (or abandoned) and
+        is never scored: calling a 2-1 an "0-5" would be far worse than
+        saying nothing.
+        """
+        played = sorted(
+            (h for h in history
+             if h.get("event_kind") == LEAGUE and h.get("result")),
+            key=lambda h: h["played_at"] or 0.0,
+        )
+
+        # Break the timeline at long silences first, then take five at a
+        # time inside each stretch.
+        stretches: list[list[dict[str, Any]]] = []
+        for h in played:
+            at = h["played_at"] or 0.0
+            if stretches and at - (stretches[-1][-1]["played_at"] or 0.0) \
+                    <= LEAGUE_RUN_GAP_SECONDS:
+                stretches[-1].append(h)
+            else:
+                stretches.append([h])
+
+        finishes: Counter = Counter()
+        open_runs: list[dict[str, Any]] = []
+        last_chunk_is_open = False
+
+        for stretch in stretches:
+            for i in range(0, len(stretch), LEAGUE_RUN_LENGTH):
+                chunk = stretch[i:i + LEAGUE_RUN_LENGTH]
+                wins = sum(1 for h in chunk if h["result"] == "W")
+                losses = len(chunk) - wins
+                complete = len(chunk) == LEAGUE_RUN_LENGTH
+                if complete:
+                    finishes["%d-%d" % (wins, losses)] += 1
+                else:
+                    open_runs.append({
+                        "wins": wins,
+                        "losses": losses,
+                        "matches": len(chunk),
+                        "started_at": chunk[0]["played_at"],
+                    })
+                last_chunk_is_open = not complete
+
+        # An open run only counts as "in progress" when it is the most
+        # recent league activity on the deck. An unfinished run followed
+        # by a later, complete one was abandoned, and showing it as live
+        # would have the deck permanently mid-league.
+        in_progress = open_runs[-1] if (open_runs and last_chunk_is_open) else None
+        abandoned = len(open_runs) - (1 if in_progress else 0)
+
+        # Every rung of the ladder is returned, zeroes included, so the
+        # UI can draw a stable set of bars instead of a shifting subset.
+        ladder = [
+            {"record": "%d-%d" % (w, LEAGUE_RUN_LENGTH - w),
+             "wins": w,
+             "runs": finishes.get("%d-%d" % (w, LEAGUE_RUN_LENGTH - w), 0)}
+            for w in range(LEAGUE_RUN_LENGTH, -1, -1)
+        ]
+        completed = sum(r["runs"] for r in ladder)
+        return {
+            "ladder": ladder,
+            "completed_runs": completed,
+            "trophies": finishes.get("5-0", 0),
+            "in_progress": in_progress,
+            # Match wins across completed runs only, so the average is
+            # comparable between decks.
+            "average_wins": (
+                sum(r["wins"] * r["runs"] for r in ladder) / completed
+            ) if completed else None,
+            "league_matches": len(played),
+            # Runs that never reached five matches. Surfaced so the sum
+            # of the ladder is not silently short of the match count.
+            "abandoned_runs": abandoned,
+        }
 
     _WUBRG = "WUBRG"
 
     def _deck_summary(deck, index) -> dict[str, Any]:
-        """Colour identity, mana curve and how much of the list resolved."""
+        """Deck colours, mana curve and how much of the list resolved.
+
+        Colours come from what the cards actually cost, not from
+        Scryfall's ``color_identity``. Identity is a Commander rule: it
+        counts every mana symbol anywhere on the card, including rules
+        text and the far side of a double-faced card. Tamiyo,
+        Inquisitive Student is identity GU because her back face has a
+        green symbol, which put a green pip on a Grixis deck that
+        contains no green card and cannot produce green mana.
+        """
         colors: set[str] = set()
         curve: dict[str, int] = defaultdict(int)
         resolved = 0
@@ -1107,7 +1477,7 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             if rec is None:
                 continue
             resolved += 1
-            colors.update(rec.color_identity or "")
+            colors.update(rec.colors or "")
             if not rec.is_land:
                 key = str(int(rec.cmc)) if rec.cmc < 7 else "7+"
                 curve[key] += c.quantity
@@ -1197,22 +1567,26 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         user = _resolve_user(user_override)
 
         matches = _all_matches(None, fmt="") if user else []
-        links = _deck_links(matches, user) if user else {}
+        links = _exact_deck_links() if user else {}
+
+        kinds = _match_event_kinds() if user else {}
 
         agg: dict[str, dict[str, Any]] = defaultdict(
-            lambda: {"wins": 0, "losses": 0, "ambiguous": 0, "last_played": 0.0}
+            lambda: {"wins": 0, "losses": 0, "last_played": 0.0}
         )
         for m in matches:
-            hit = links.get(m.match_id)
-            if hit is None or not m.match_winner:
+            deck_id = links.get(m.match_id)
+            if deck_id is None or not m.match_winner:
                 continue
-            a = agg[hit.deck_id]
+            # A practice game against a friend says nothing about how a
+            # deck performs, so it never reaches a win rate.
+            if kinds.get(m.match_id) == CASUAL:
+                continue
+            a = agg[deck_id]
             if m.match_winner == user:
                 a["wins"] += 1
             else:
                 a["losses"] += 1
-            if hit.ambiguous:
-                a["ambiguous"] += 1
             a["last_played"] = max(a["last_played"], m.log_mtime or 0.0)
 
         freq = _deck_card_frequency(decks, index)
@@ -1237,7 +1611,6 @@ def create_app(db_path: Path | None = None) -> FastAPI:
                 "losses": losses,
                 "matches": played,
                 "winrate": (wins / played) if played else None,
-                "ambiguous_matches": rec["ambiguous"] if rec else 0,
                 "last_played": (rec["last_played"] or None) if rec else None,
                 "key_cards": _key_cards(d, index, freq, total_decks),
                 **_deck_summary(d, index),
@@ -1248,8 +1621,19 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         return {
             "decks": out,
             "card_index_size": len(index),
+            # True while the Scryfall index is downloading. Card names
+            # are missing until it lands, and the UI should say so
+            # rather than let the list look broken.
+            "card_index_building": bool(_deck_cache.get("index_building")),
+            # Only matches MTGO itself recorded a registered deck for.
+            # This grows while the app is open and cannot be backfilled:
+            # the client rotates the log that carries it.
             "attributed_matches": len(links),
             "total_matches": len(matches),
+            # Counted from the casual set itself, not from `kinds`: by
+            # the time a match reaches here it has already been dropped,
+            # so the surviving rows can never account for the exclusion.
+            "excluded_friendly": len(_casual_match_ids()) if user else 0,
         }
 
     @app.get("/api/decklists/{deck_id}")
@@ -1272,7 +1656,10 @@ def create_app(db_path: Path | None = None) -> FastAPI:
                     "quantity": c.quantity,
                     # An unresolved catalog id still appears, labelled, so
                     # the list stays a true 75 instead of silently short.
-                    "name": rec.name if rec else "Unknown card #%d" % c.mtgo_id,
+                    # These are nearly always cards from a set released
+                    # in the last few weeks: MTGO has the catalog number
+                    # before Scryfall publishes the mapping for it.
+                    "name": rec.name if rec else "New card #%d" % c.mtgo_id,
                     "mana_cost": rec.mana_cost if rec else "",
                     "type_line": rec.type_line if rec else "",
                     "cmc": rec.cmc if rec else 0.0,
@@ -1291,16 +1678,19 @@ def create_app(db_path: Path | None = None) -> FastAPI:
 
         user = _resolve_user(user_override)
         matches = _all_matches(None, fmt="") if user else []
-        links = _deck_links(matches, user) if user else {}
+        links = _exact_deck_links() if user else {}
 
         history: list[dict[str, Any]] = []
         opponents: Counter = Counter()
         vs: dict[str, dict[str, int]] = defaultdict(
             lambda: {"wins": 0, "losses": 0}
         )
+        kinds = _match_event_kinds() if user else {}
+
         for m in matches:
-            hit = links.get(m.match_id)
-            if hit is None or hit.deck_id != deck_id:
+            if links.get(m.match_id) != deck_id:
+                continue
+            if kinds.get(m.match_id) == CASUAL:
                 continue
             opp = next((p for p in m.players if p != user), None)
             if not opp:
@@ -1328,8 +1718,10 @@ def create_app(db_path: Path | None = None) -> FastAPI:
                     ("%s-%s" % (m.score_won, m.score_lost)) if won
                     else ("%s-%s" % (m.score_lost, m.score_won))
                 ) if m.score_won is not None else None,
-                "confidence": hit.coverage,
-                "ambiguous": hit.ambiguous,
+                # MTGO's own record of the registered deck, so there
+                # is no confidence to report — it either matched or the
+                # match is absent entirely.
+                "event_kind": kinds.get(m.match_id, "unknown"),
             })
 
         history.sort(key=lambda r: r["played_at"] or 0, reverse=True)
@@ -1365,6 +1757,9 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             "winrate": (wins / (wins + losses)) if (wins + losses) else None,
             "matchups": matchups,
             "history": history[:100],
+            # Runs are scored over the full history, not the truncated
+            # slice the UI lists.
+            "leagues": _league_runs(history),
             "distinct_opponents": len(opponents),
             **_deck_summary(deck, index),
         }

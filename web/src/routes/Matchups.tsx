@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react"
-import { useQuery } from "@tanstack/react-query"
 import { Link } from "react-router-dom"
 import { api } from "@/lib/api"
+import { usePersistedQuery } from "@/lib/persist"
 import { pct, winrateColor } from "@/lib/format"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import {
@@ -34,8 +34,10 @@ export function Matchups() {
   const rangeParams = { ...rangeToParams(range), format, user: account || undefined }
   const rkey = `${rangeKey(range)}|${format}|${account}`
 
-  const decks = useQuery({ queryKey: ["decks", rkey], queryFn: () => api.decks(rangeParams) })
-  const matchups = useQuery({
+  const decks = usePersistedQuery({ queryKey: ["decks", rkey], queryFn: () => api.decks(rangeParams) })
+  // The matrix is the slowest thing in the app to compute, and it
+  // barely moves between launches — exactly what a cache is for.
+  const matchups = usePersistedQuery({
     queryKey: ["matchups", rkey, yourDeck],
     queryFn: () => api.matchups({ ...rangeParams, your_deck: yourDeck || undefined }),
   })
