@@ -1,7 +1,7 @@
 {
   "name": "metahunter-desktop",
   "productName": "Metahunter",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "MTGO match tracker and meta dashboard",
   "main": "main.js",
   "private": true,

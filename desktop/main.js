@@ -354,6 +354,51 @@ function iconPath(name) {
   return fs.existsSync(p) ? p : null;
 }
 
+/**
+ * Drop the HTTP cache when the app version changes.
+ *
+ * The window is served from a local HTTP server, so Chromium caches it
+ * like any website — including index.html, whose URL stays the same
+ * across releases while its contents change. After an update the
+ * renderer would reload the *old* index.html from cache, which names
+ * the old asset hashes, which are also cached. The backend updates,
+ * the interface does not, and nothing anywhere reports an error.
+ *
+ * The server now sends no-store on index.html, which prevents this
+ * from recurring. This handles the installs that already have a stale
+ * copy, and costs one cache flush per upgrade — nothing the user
+ * notices, since the assets are local.
+ */
+async function clearCacheOnUpgrade() {
+  const { session } = require('electron');
+  const stampFile = path.join(app.getPath('userData'), 'last-version');
+  const current = app.getVersion();
+
+  let previous = null;
+  try {
+    previous = fs.readFileSync(stampFile, 'utf8').trim();
+  } catch {
+    // No stamp: either a fresh install or one from before this existed.
+    // Clearing once is harmless, and the second case is exactly the one
+    // that needs it.
+  }
+
+  if (previous === current) return;
+
+  try {
+    await session.defaultSession.clearCache();
+    if (verbose) console.log(`[metahunter] cleared cache (${previous || 'unknown'} -> ${current})`);
+  } catch (err) {
+    console.warn('[metahunter] could not clear cache:', err && err.message);
+  }
+  try {
+    fs.mkdirSync(path.dirname(stampFile), { recursive: true });
+    fs.writeFileSync(stampFile, current, 'utf8');
+  } catch {
+    // Not fatal — we would just clear the cache again next launch.
+  }
+}
+
 function createWindow() {
   const icon = iconPath('icon.png');
 
@@ -498,6 +543,7 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(async () => {
     try {
+      await clearCacheOnUpgrade();
       backendPort = await findFreePort();
       await startBackend(backendPort);
       createTray();

@@ -2014,6 +2014,9 @@ def create_app(db_path: Path | None = None) -> FastAPI:
     if WEB_DIST.exists() and (WEB_DIST / "index.html").exists():
         from fastapi.responses import FileResponse
 
+        # Asset filenames carry a content hash, so a given URL's bytes
+        # can never change. Caching them forever is both safe and the
+        # whole point of hashing them.
         app.mount(
             "/assets",
             StaticFiles(directory=str(WEB_DIST / "assets")),
@@ -2022,7 +2025,20 @@ def create_app(db_path: Path | None = None) -> FastAPI:
 
         @app.get("/{full_path:path}", include_in_schema=False)
         def spa_fallback(full_path: str):  # noqa: ARG001
-            return FileResponse(WEB_DIST / "index.html")
+            # index.html must never be cached. It is the only file whose
+            # URL stays the same while its contents change, so a cached
+            # copy pins the app to an old set of asset hashes — which
+            # are themselves cached, and still on disk in the old
+            # install. The result is an app that updates its backend and
+            # goes on rendering the previous release's interface, with
+            # no error anywhere to explain it. That happened.
+            return FileResponse(
+                WEB_DIST / "index.html",
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate",
+                    "Pragma": "no-cache",
+                },
+            )
 
     return app
 
