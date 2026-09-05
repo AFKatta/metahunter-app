@@ -25,6 +25,8 @@ from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from mtgo_meta import net
+
 log = logging.getLogger(__name__)
 
 DEFAULT_SERVER_URL = "https://metahunter-api.fly.dev"
@@ -72,7 +74,7 @@ class UploadClient:
             method=method,
         )
         try:
-            with urlrequest.urlopen(req, timeout=self.timeout) as resp:
+            with net.urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read()
                 return resp.status, json.loads(raw) if raw else {}
         except urlerror.HTTPError as exc:

@@ -250,7 +250,49 @@ export type DecklistDetail = {
   resolved_cards: number
 }
 
+/** The Metahunter account signed in on this machine. */
+export type AuthStatus = {
+  signed_in: boolean
+  display_name: string
+  avatar_url: string | null
+  players: {
+    mtgo_username: string
+    is_primary: boolean
+    claimed_at: string
+    leaderboard_visible: boolean
+  }[]
+  server: string
+}
+
+export type ClaimCandidate = {
+  mtgo_username: string
+  matches: number
+  last_played: number | null
+  claimable: boolean
+  claimed_by_you: boolean
+  /** True when we couldn't reach the server to check. */
+  unknown?: boolean
+}
+
 export const api = {
+  authStatus: (refresh = false) =>
+    get<AuthStatus>(`/api/auth/status${refresh ? "?refresh=true" : ""}`),
+  authProviders: () =>
+    get<{ providers: string[]; offline?: boolean }>("/api/auth/providers"),
+  authStart: (provider: string) =>
+    postJson<{ url: string; opened: boolean }>(
+      `/api/auth/start?provider=${encodeURIComponent(provider)}`, {}
+    ),
+  authLogout: () => postJson<void>("/api/auth/logout", {}),
+  claimCandidates: () =>
+    get<{ candidates: ClaimCandidate[] }>("/api/auth/claim-candidates"),
+  claimPlayer: (mtgo_username: string) =>
+    postJson<{ mtgo_username: string; already_yours: boolean }>(
+      `/api/auth/claim?mtgo_username=${encodeURIComponent(mtgo_username)}`, {}
+    ),
+  syncDecks: () =>
+    postJson<{ stored: number; removed: number }>("/api/auth/sync-decks", {}),
+
   decklists: (r: { user?: string; format?: string; refresh?: boolean } = {}) =>
     get<DecklistsResponse>(
       `/api/decklists${qs({

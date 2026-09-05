@@ -10,6 +10,8 @@ from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from mtgo_meta import net
+
 from mtgo_meta.paths import user_data_dir
 
 log = logging.getLogger(__name__)
@@ -42,7 +44,7 @@ def download_installer(
 
     req = urlrequest.Request(url, headers={"User-Agent": "metahunter-updater"})
     try:
-        with urlrequest.urlopen(req, timeout=timeout) as resp:
+        with net.urlopen(req, timeout=timeout) as resp:
             total = resp.headers.get("Content-Length")
             total_i = int(total) if total and total.isdigit() else None
             done = 0

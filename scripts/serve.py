@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import sqlite3
 import subprocess
@@ -270,6 +271,11 @@ def main() -> int:
 
     if not args.no_watch:
         _start_watcher(Path(args.db))
+
+    # Sign-in sends the browser back to 127.0.0.1:<port>/auth/callback,
+    # so the API has to know the port we actually bound — which is not
+    # always the one that was asked for.
+    os.environ["METAHUNTER_LOCAL_PORT"] = str(port)
 
     app = create_app(db_path=Path(args.db))
 

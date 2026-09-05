@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "Local MTGO match-log scraper and personal meta dashboard"
 requires-python = ">=3.11"
 dependencies = [
+    # Our own TLS trust roots. Windows fills its root store lazily, so
+    # Python can fail to verify a perfectly valid certificate there;
+    # see mtgo_meta/net.py. Not optional — sign-in depends on it.
+    "certifi>=2024.2.2",
     "pydantic>=2.6",
     "watchdog>=4",
     "fastapi>=0.110",

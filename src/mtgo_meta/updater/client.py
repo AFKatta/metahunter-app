@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from mtgo_meta import net
+
 from mtgo_meta import __version__
 
 log = logging.getLogger(__name__)
@@ -98,7 +100,7 @@ def fetch_latest_release(*, timeout: float = 15.0) -> ReleaseInfo | None:
         },
     )
     try:
-        with urlrequest.urlopen(req, timeout=timeout) as resp:
+        with net.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
     except (urlerror.URLError, json.JSONDecodeError) as exc:
         log.warning("updater: GitHub fetch failed: %s", exc)

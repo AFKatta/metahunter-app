@@ -91,6 +91,9 @@ if fmt_data.exists():
 # Hidden imports — modules PyInstaller's static analysis misses because
 # they're loaded dynamically by frameworks.
 hiddenimports = [
+    # Carried explicitly: net.py imports it dynamically, so
+    # PyInstaller cannot see the dependency by analysis alone.
+    "certifi",
     # uvicorn picks its event loop / HTTP protocol at runtime.
     "uvicorn.lifespan.on",
     "uvicorn.lifespan.off",

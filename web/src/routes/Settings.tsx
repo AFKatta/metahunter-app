@@ -1,6 +1,6 @@
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { ShieldAlert, Upload } from "lucide-react"
+import { ShieldAlert, Upload, UserRound } from "lucide-react"
 import { api } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -8,8 +8,81 @@ import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
 
 /**
- * In-app settings for the consent / upload subsystem.
+ * The signed-in Metahunter account and the MTGO players linked to it.
  *
+ * Signing out is deliberately here rather than in the header: it drops
+ * the app back to the login gate, which is not something to put one
+ * stray click away from the dashboard.
+ */
+function AccountCard() {
+  const qc = useQueryClient()
+  const status = useQuery({
+    queryKey: ["auth-status"],
+    queryFn: () => api.authStatus(),
+  })
+  const sync = useMutation({ mutationFn: () => api.syncDecks() })
+  const out = useMutation({
+    mutationFn: () => api.authLogout(),
+    onSuccess: () => qc.invalidateQueries(),
+  })
+
+  const a = status.data
+  if (!a?.signed_in) return null
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <UserRound className="h-4 w-4" />
+          Your account
+        </CardTitle>
+        <CardDescription>
+          Signed in as <strong>{a.display_name}</strong>. Your matches and decks
+          appear at metahunter-web.vercel.app when you sign in there with the
+          same account.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3 text-sm">
+        <Row label="MTGO account">
+          {a.players.length
+            ? a.players.map((p) => p.mtgo_username).join(", ")
+            : "none linked"}
+        </Row>
+        <Separator />
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => sync.mutate()}
+            disabled={sync.isPending}
+          >
+            {sync.isPending ? "Uploading…" : "Upload decks now"}
+          </Button>
+          {sync.data && (
+            <span className="text-xs text-muted-foreground">
+              {sync.data.stored} deck{sync.data.stored === 1 ? "" : "s"} uploaded
+              {sync.data.removed > 0 && `, ${sync.data.removed} removed`}
+            </span>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="ml-auto"
+            onClick={() => out.mutate()}
+            disabled={out.isPending}
+          >
+            Sign out
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+/**
+ * In-app settings: the account, and the consent / upload subsystem.
+ *
+ *   * Account: who is signed in, the linked MTGO player, sign out.
  *   * Read-only: install_id, server URL, when consent was granted.
  *   * Toggle: leaderboard visibility (PATCH /api/upload/leaderboard).
  *   * Danger: wipe server-side data (DELETE /api/upload/all). After
@@ -44,6 +117,8 @@ export function Settings() {
           Manage what gets shared with the central Metahunter server.
         </p>
       </div>
+
+      <AccountCard />
 
       <Card>
         <CardHeader>

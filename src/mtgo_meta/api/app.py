@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
+import urllib.error
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -55,8 +58,59 @@ from mtgo_meta.paths import (
     web_dist_dir,
 )
 from mtgo_meta.store import open_store
+from mtgo_meta import account, net
+from mtgo_meta.upload.client import server_url as upload_server_url
 
 log = logging.getLogger(__name__)
+
+
+def _local_port() -> int:
+    """The port this server is actually listening on.
+
+    Sign-in needs it: the browser is told to come back to
+    127.0.0.1:<port>/auth/callback, and that has to be the real port,
+    which is usually 8765 but steps aside when something else holds it.
+    serve.py publishes it here once it has bound.
+    """
+    try:
+        return int(os.environ.get("METAHUNTER_LOCAL_PORT") or 8765)
+    except ValueError:
+        return 8765
+
+
+def _auth_result_page(ok: bool, message: str) -> str:
+    """The page the browser shows after a sign-in attempt.
+
+    Deliberately plain and self-contained — it is served from the
+    desktop app's own local server, so it cannot reach out for fonts or
+    stylesheets, and it is only on screen for a moment.
+    """
+    title = "You're signed in" if ok else "Sign-in failed"
+    tone = "#22c55e" if ok else "#ef4444"
+    body = (
+        "Metahunter is ready. You can close this tab and go back to the app."
+        if ok else message
+    )
+    who = f"<p class='who'>{message}</p>" if ok and message else ""
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>{title} — Metahunter</title>
+<style>
+ body {{ margin:0; min-height:100vh; display:grid; place-items:center;
+        background:#0b0b0c; color:#e8e8ea;
+        font:15px/1.6 system-ui,-apple-system,Segoe UI,sans-serif; }}
+ .card {{ max-width:26rem; padding:2.5rem; text-align:center; }}
+ .dot {{ width:.6rem; height:.6rem; border-radius:50%; background:{tone};
+        display:inline-block; margin-right:.5rem; }}
+ h1 {{ font-size:1.35rem; margin:0 0 .75rem; }}
+ p {{ color:#a1a1aa; margin:0; }}
+ .who {{ margin-top:.75rem; color:#e8e8ea; font-weight:600; }}
+</style></head>
+<body><div class="card">
+ <h1><span class="dot"></span>{title}</h1>
+ <p>{body}</p>{who}
+</div></body></html>"""
+
 
 FORMAT_DATA = format_data_dir()
 DEFAULT_DB = default_db_path()
@@ -1773,6 +1827,187 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             return {"ok": True, "cards": n}
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # ------------------------------------------------------------------
+    # Account: signing in, and linking this machine's MTGO player
+    # ------------------------------------------------------------------
+    #
+    # Sign-in happens in the system browser, not in a window we drew, so
+    # the user types their password into Discord's own page and we never
+    # have the chance to see it. The browser returns to /auth/callback
+    # below with a session token.
+
+    @app.get("/api/auth/status")
+    def auth_status(refresh: bool = Query(False)) -> dict[str, Any]:
+        """Who is signed in, and which MTGO accounts they have claimed."""
+        acct = account.refresh(force=refresh) if refresh else account.load()
+        # A cached profile is used while offline, so the app keeps
+        # working on a train; it is re-checked in the background.
+        if acct.signed_in and not refresh:
+            threading.Thread(target=account.refresh, daemon=True).start()
+        return {
+            "signed_in": acct.signed_in,
+            "display_name": acct.display_name,
+            "avatar_url": acct.avatar_url,
+            "players": acct.players,
+            "server": upload_server_url(),
+        }
+
+    @app.get("/api/auth/providers")
+    def auth_providers() -> dict[str, Any]:
+        """Which sign-in buttons to offer, straight from the server."""
+        try:
+            # Generous timeout: the API machine stops when idle, so the
+            # first call of the day pays for a cold start. Reporting
+            # "offline" because we gave up after ten seconds would send
+            # people to check a connection that is perfectly fine.
+            with net.urlopen(
+                f"{upload_server_url()}/v1/auth/providers", timeout=30
+            ) as resp:
+                return json.loads(resp.read())
+        except Exception as exc:  # noqa: BLE001 - offline, or the API is asleep
+            log.warning("could not fetch sign-in providers: %s", exc)
+            return {"providers": [], "offline": True}
+
+    @app.post("/api/auth/start")
+    def auth_start(provider: str = Query("discord")) -> dict[str, Any]:
+        """Open the browser to sign in. Returns the URL for the UI too."""
+        # The callback has to name this server's real port: it is
+        # usually 8765 but steps aside when that is taken.
+        callback = f"http://127.0.0.1:{_local_port()}/auth/callback"
+        url = account.start_sign_in(provider, callback)
+        try:
+            import webbrowser
+            webbrowser.open(url)
+            opened = True
+        except Exception:  # noqa: BLE001
+            opened = False
+        return {"url": url, "opened": opened}
+
+    @app.get("/auth/callback", include_in_schema=False)
+    def auth_callback(
+        token: str | None = Query(None),
+        nonce: str = Query(""),
+        error: str | None = Query(None),
+    ):
+        """Where the browser lands after the provider signs the user in.
+
+        Registered before the SPA catch-all below, which would otherwise
+        swallow it and hand back index.html.
+        """
+        from fastapi.responses import HTMLResponse
+
+        if error or not token:
+            return HTMLResponse(
+                _auth_result_page(False, error or "Sign-in was cancelled."),
+                status_code=400,
+            )
+        try:
+            acct = account.accept_callback(nonce, token)
+        except ValueError as exc:
+            # Either a replayed callback or one this app never started.
+            return HTMLResponse(_auth_result_page(False, str(exc)), status_code=400)
+        return HTMLResponse(
+            _auth_result_page(True, acct.display_name or "You are signed in.")
+        )
+
+    @app.post("/api/auth/logout", status_code=204)
+    def auth_logout() -> None:
+        account.sign_out()
+
+    @app.get("/api/auth/claim-candidates")
+    def claim_candidates() -> dict[str, Any]:
+        """Local MTGO accounts, and whether each can still be claimed.
+
+        The app only ever offers usernames it can actually see in the
+        MTGO folder on this machine — that is what makes the claim mean
+        something more than typing a name into a box.
+        """
+        acct = account.load()
+        if not acct.signed_in:
+            raise HTTPException(401, "sign in first")
+
+        out = []
+        for row in accounts():
+            name = row["user"]
+            status: dict[str, Any] = {
+                "mtgo_username": name,
+                "matches": row.get("matches", 0),
+                "last_played": row.get("last_played"),
+                "claimed_by_you": name in acct.claimed_usernames,
+            }
+            if not status["claimed_by_you"]:
+                try:
+                    avail = account.availability(name)
+                    status["claimable"] = bool(avail.get("claimable"))
+                except Exception:  # noqa: BLE001 - offline: let them try
+                    status["claimable"] = True
+                    status["unknown"] = True
+            else:
+                status["claimable"] = False
+            out.append(status)
+
+        out.sort(key=lambda r: -(r.get("matches") or 0))
+        return {"candidates": out}
+
+    @app.post("/api/auth/claim")
+    def claim(mtgo_username: str = Query(...)) -> dict[str, Any]:
+        """Link one MTGO username to the signed-in account."""
+        from mtgo_meta.upload.state import load_or_create_state
+        try:
+            install_id, _salt = load_or_create_state()
+        except Exception:  # noqa: BLE001
+            install_id = None
+        try:
+            return account.claim_player(mtgo_username, str(install_id) if install_id else None)
+        except PermissionError as exc:
+            raise HTTPException(401, str(exc)) from exc
+        except urllib.error.HTTPError as exc:
+            detail = "could not claim this account"
+            try:
+                detail = json.loads(exc.read()).get("detail", detail)
+            except Exception:  # noqa: BLE001
+                pass
+            raise HTTPException(exc.code, detail) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(502, f"could not reach the server: {exc}") from exc
+
+    @app.post("/api/auth/sync-decks")
+    def sync_decks() -> dict[str, Any]:
+        """Push the saved decks to the server for the website."""
+        try:
+            return _push_decks()
+        except PermissionError as exc:
+            raise HTTPException(401, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(502, f"could not reach the server: {exc}") from exc
+
+    def _push_decks() -> dict[str, Any]:
+        """Serialise saved decks and hand them to the server."""
+        payload = []
+        for d in _saved_decks():
+            payload.append({
+                "deck_uid": d.deck_id,
+                "name": d.name[:160],
+                "format": d.format[:32],
+                "signature": _maindeck_signature(d)[:128],
+                "modified_at": datetime.fromtimestamp(
+                    d.modified_at or 0, timezone.utc
+                ).isoformat(),
+                "cards": [
+                    [c.mtgo_id, c.quantity, 1 if c.sideboard else 0]
+                    for c in d.cards
+                ],
+            })
+        return account.upload_decks(payload)
+
+    def _maindeck_signature(deck) -> str:
+        """Same fingerprint the match attribution uses, so they join up."""
+        import hashlib
+        key = "|".join(sorted(
+            f"{c.mtgo_id}:{c.quantity}" for c in deck.maindeck
+        ))
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
     # router owns every non-/api route, so we serve index.html as the
     # fallback for anything not found in /assets/.

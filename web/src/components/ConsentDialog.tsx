@@ -54,12 +54,16 @@ export function ConsentDialog() {
           <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs">
             <strong className="font-semibold">What gets shared:</strong>{" "}
             match metadata (your archetype, opponent's archetype,
-            colours, cards observed, who won), uploaded to{" "}
+            colours, cards observed, who won), and — once you sign in —
+            your saved decklists, so the website can show you the same
+            lists this app does. Your decks are visible only to you.
+            Everything goes to{" "}
             <code className="rounded bg-muted px-1">metahunter-api.fly.dev</code>.
             Your MTGO username goes up plaintext (you're consenting
             on your own behalf); every opponent's name is HMAC-hashed
             with a 32-byte secret that stays on your machine forever.
-            Nothing else leaves this PC.
+            Nothing else leaves this PC — not your collection, not your
+            trades, nothing outside MTGO's match logs and deck files.
           </div>
 
           <label className="flex cursor-pointer items-start gap-3 rounded-md border p-3 hover:bg-accent/30">
