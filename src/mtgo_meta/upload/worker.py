@@ -25,6 +25,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+from metahunter_core.deck_files import maindeck_signature
 from metahunter_core.classifier import (
     build_card_colors, build_card_weights, classify_by_similarity,
     recompute_deck_color_identity,
@@ -41,6 +42,19 @@ log = logging.getLogger(__name__)
 META_KEY_LAST_UPLOADED = "last_uploaded_log_mtime"
 DEFAULT_INTERVAL_SECONDS = 5 * 60
 BATCH_SIZE = 100
+
+
+def _signature_for(registered, match_id):
+    """Maindeck fingerprint for a match, or None when unknown."""
+    if not registered:
+        return None
+    row = registered.get(match_id)
+    if not row or not row.get("cards"):
+        return None
+    try:
+        return maindeck_signature(row["cards"])[:128]
+    except Exception:  # noqa: BLE001 - a malformed row is not fatal
+        return None
 
 
 class Uploader:
@@ -112,6 +126,21 @@ class Uploader:
             except ValueError:
                 parser_version = 0
 
+            # Matches we now know the registered deck for, even if they
+            # were uploaded before we knew it. The watermark only moves
+            # forward, so without this an older match could never gain
+            # its attribution — the server can only fill that gap from
+            # an upload that carries the signature. The set is small
+            # (MTGO's log reaches back days, not months) and re-sending
+            # is idempotent, so this is cheap insurance.
+            known = set(store.registered_by_match())
+            if known:
+                seen = {m.match_id for m in rows}
+                rows = list(rows) + [
+                    m for m in store.iter_matches()
+                    if m.match_id in known and m.match_id not in seen
+                ]
+
         if not rows:
             return {"new": 0}
 
@@ -126,6 +155,16 @@ class Uploader:
         if not all_counter:
             return {"skipped": -1, "reason": "no players"}
         user = all_counter.most_common(1)[0][0]
+
+        # Which decklist MTGO recorded as registered, per match. Only
+        # covers matches the rolling text log still reaches, which is a
+        # small and recent slice — everything else uploads without a
+        # signature and simply is not attributed to a decklist.
+        try:
+            with open_store(default_db_path()) as store:
+                registered = store.registered_by_match()
+        except Exception:  # noqa: BLE001 - attribution is a bonus, not a gate
+            registered = {}
 
         # Build payloads.
         batch: list[dict] = []
@@ -149,7 +188,7 @@ class Uploader:
 
         for m in rows:
             payload = self._build_payload(
-                m, user, install_salt, parser_version,
+                m, user, install_salt, parser_version, registered,
             )
             if payload is None:
                 continue
@@ -161,10 +200,16 @@ class Uploader:
 
         if sent > 0 and errors == 0:
             with open_store(default_db_path()) as store:
-                store.set_meta(META_KEY_LAST_UPLOADED, str(max_seen_mtime))
+                # max(), because the batch may now include older matches
+                # re-sent for attribution; letting one of those set the
+                # watermark would re-upload everything after it forever.
+                store.set_meta(
+                    META_KEY_LAST_UPLOADED, str(max(max_seen_mtime, since))
+                )
         return {"sent": sent, "new": new, "merged": merged, "errors": errors}
 
-    def _build_payload(self, m, user, install_salt, parser_version):
+    def _build_payload(self, m, user, install_salt, parser_version,
+                       registered=None):
         if user not in m.players:
             return None
         opp = next((p for p in m.players if p != user), None)
@@ -193,6 +238,11 @@ class Uploader:
             "turns": m.turns or 0,
             "you": {
                 "username": user,
+                # Present only when MTGO actually recorded which deck was
+                # registered. Absent is the normal case and must stay
+                # meaningful: the server treats it as "unknown", never as
+                # "no deck".
+                "deck_signature": _signature_for(registered, m.match_id),
                 "deck": you_label, "deck_colors": "",
                 "on_play": (m.first_player == user) if m.first_player else None,
                 "won": you_won,

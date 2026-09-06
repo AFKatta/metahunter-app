@@ -26,7 +26,11 @@ from fastapi.staticfiles import StaticFiles
 
 from metahunter_core.card_index import CardIndex
 from metahunter_core.card_index import build_index as build_card_index
-from metahunter_core.deck_files import load_decks, mtgo_history_files
+from metahunter_core.deck_files import (
+    deck_signature,
+    load_decks,
+    mtgo_history_files,
+)
 from metahunter_core.event_kind import (
     CASUAL,
     LEAGUE,
@@ -1990,7 +1994,7 @@ def create_app(db_path: Path | None = None) -> FastAPI:
                 "deck_uid": d.deck_id,
                 "name": d.name[:160],
                 "format": d.format[:32],
-                "signature": _maindeck_signature(d)[:128],
+                "signature": deck_signature(d)[:128],
                 "modified_at": datetime.fromtimestamp(
                     d.modified_at or 0, timezone.utc
                 ).isoformat(),
@@ -2000,14 +2004,6 @@ def create_app(db_path: Path | None = None) -> FastAPI:
                 ],
             })
         return account.upload_decks(payload)
-
-    def _maindeck_signature(deck) -> str:
-        """Same fingerprint the match attribution uses, so they join up."""
-        import hashlib
-        key = "|".join(sorted(
-            f"{c.mtgo_id}:{c.quantity}" for c in deck.maindeck
-        ))
-        return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
     # router owns every non-/api route, so we serve index.html as the
     # fallback for anything not found in /assets/.
