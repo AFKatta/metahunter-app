@@ -4,6 +4,7 @@ import { api, type DeckCard } from "@/lib/api"
 import { usePersistedQuery } from "@/lib/persist"
 import { useAccount } from "@/components/AccountProvider"
 import { LeagueFinishes } from "@/components/LeagueFinishes"
+import { VersionPicker } from "@/components/VersionPicker"
 import { ManaCost, ManaCurve } from "@/components/ManaCost"
 import { ago, pct, record, winrateColor } from "@/lib/format"
 import { cn } from "@/lib/utils"
@@ -51,10 +52,18 @@ export function DeckDetail() {
   const { id = "" } = useParams()
   const { account } = useAccount()
   const [preview, setPreview] = useState<DeckCard | null>(null)
+  // null means "whatever the server considers current" — the newest
+  // list. Picking a version pins the whole page to it: the cards, the
+  // record, the matchups and the league runs are all that list's.
+  const [version, setVersion] = useState<string | null>(null)
 
   const q = usePersistedQuery({
-    queryKey: ["decklist", id, account],
-    queryFn: () => api.decklist(id, { user: account || undefined }),
+    queryKey: ["decklist", id, account, version],
+    queryFn: () =>
+      api.decklist(id, {
+        user: account || undefined,
+        version: version || undefined,
+      }),
     enabled: Boolean(id),
     staleTime: 30_000,
   })
@@ -116,15 +125,27 @@ export function DeckDetail() {
             <p className="mt-1 text-sm text-muted-foreground">
               {d.format} · {d.maindeck_count} maindeck / {d.sideboard_count}{" "}
               sideboard · edited {ago(d.modified_at)}
+              {d.versions.length > 1 && (
+                <>
+                  {" · "}
+                  <span title="This deck has been edited; you are seeing one of its lists.">
+                    {d.versions.findIndex((v) => v.signature === d.version) === 0
+                      ? "latest list"
+                      : "an earlier list"}{" "}
+                    of {d.versions.length}
+                  </span>
+                </>
+              )}
             </p>
           </div>
           <div className="flex gap-6">
             <Stat
-              label="Record"
+              label={d.version_pinned ? "This list" : "Record"}
               value={d.winrate == null ? "—" : pct(d.winrate)}
               sub={
                 d.wins + d.losses > 0
-                  ? record(d.wins, d.losses)
+                  ? record(d.wins, d.losses) +
+                    (d.version_pinned ? "" : d.versions.length > 1 ? " · all lists" : "")
                   : "no confirmed games"
               }
               tone={d.winrate}
@@ -181,6 +202,14 @@ export function DeckDetail() {
               </div>
             )}
           </div>
+
+          <VersionPicker
+            versions={d.versions}
+            selected={d.version}
+            onSelect={setVersion}
+            pinned={d.version_pinned}
+            onClear={() => setVersion(null)}
+          />
 
           <ManaCurve curve={d.curve} uncharted={groups.uncharted} />
 

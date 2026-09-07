@@ -128,6 +128,29 @@ class _TextLogPoller(threading.Thread):
     def stop(self) -> None:
         self._stop.set()
 
+    def _snapshot_decks(self) -> None:
+        """Record any deck list we have not seen before."""
+        try:
+            from metahunter_core.deck_files import load_decks
+            from mtgo_meta import deck_history
+
+            decks = load_decks(constructed_only=True)
+            if not decks:
+                return
+            conn = sqlite3.connect(self.db_path)
+            try:
+                store = MatchStore(conn)
+                result = deck_history.sync(store, decks)
+                if result.get("new") or result.get("recovered"):
+                    print(
+                        f"  decks: {result['new']} new list(s), "
+                        f"{result['recovered']} recovered"
+                    )
+            finally:
+                conn.close()
+        except Exception as e:  # noqa: BLE001 - never block the poller
+            print(f"  decks: {e}", file=sys.stderr)
+
     def run(self) -> None:
         # A first pass on startup picks up anything written while the
         # app was closed but before MTGO rotated the log.
@@ -139,6 +162,13 @@ class _TextLogPoller(threading.Thread):
                 print(f"  textlog: {e}", file=sys.stderr)
 
     def _tick(self, first: bool = False) -> None:
+        # Snapshot the saved decks first, every tick. MTGO overwrites a
+        # deck file the moment you edit it, so a list only exists between
+        # one edit and the next — if we waited for someone to open the
+        # Decks page, an edit made mid-league would take the list that
+        # played it with it. This is the "memory" the deck history needs.
+        self._snapshot_decks()
+
         changed = []
         for p in find_log_files():
             try:

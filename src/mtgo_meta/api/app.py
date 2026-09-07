@@ -27,8 +27,10 @@ from fastapi.staticfiles import StaticFiles
 from metahunter_core.card_index import CardIndex
 from metahunter_core.card_index import build_index as build_card_index
 from metahunter_core.deck_files import (
+    DeckCard,
     deck_signature,
     load_decks,
+    maindeck_signature,
     mtgo_history_files,
 )
 from metahunter_core.event_kind import (
@@ -62,7 +64,7 @@ from mtgo_meta.paths import (
     web_dist_dir,
 )
 from mtgo_meta.store import open_store
-from mtgo_meta import account, net
+from mtgo_meta import account, deck_history, net
 from mtgo_meta.upload.client import server_url as upload_server_url
 
 log = logging.getLogger(__name__)
@@ -472,13 +474,15 @@ def create_app(db_path: Path | None = None) -> FastAPI:
     _deck_cache: dict[str, Any] = {
         "decks": None, "at": 0.0, "links": None, "index": None,
         "casual_ids": None, "event_kinds": None, "registered": None,
-        "exact_links": None, "fingerprint": None,
+        "exact_links": None, "fingerprint": None, "versions": None,
+        "version_index": None, "match_decks": None,
     }
 
     # Everything above except the card index is derived from the match
     # store, so all of it has to go when the store moves.
     _STORE_DERIVED = ("casual_ids", "event_kinds", "registered",
-                      "exact_links", "links")
+                      "exact_links", "links", "versions",
+                      "version_index", "match_decks")
 
     def _sync_cache() -> None:
         """Drop store-derived caches when the store has changed.
@@ -1308,6 +1312,9 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             # that changes a maindeck invalidates them too.
             _deck_cache["links"] = None
             _deck_cache["exact_links"] = None
+            _deck_cache["versions"] = None
+            _deck_cache["version_index"] = None
+            _deck_cache["match_decks"] = None
         return _deck_cache["decks"] or []
 
     def _match_event_kinds() -> dict[str, str]:
@@ -1383,37 +1390,77 @@ def create_app(db_path: Path | None = None) -> FastAPI:
                 _deck_cache["registered"] = {}
         return _deck_cache["registered"] or {}
 
-    def _exact_deck_links() -> dict[str, str]:
-        """match id -> saved deck id, only where MTGO told us.
+    def _versions() -> list[dict[str, Any]]:
+        """Every version of every deck we have ever seen.
 
-        Signatures are compared on the maindeck alone. A player edits
-        the sideboard between rounds of the same league run, which
-        rewrites the saved file, so demanding all 75 match would reject
-        the very games we most want to attribute.
+        Kept in the store rather than read from disk, because MTGO
+        overwrites a deck file when you edit it: the list you registered
+        last week stops existing this week. Synced here so opening any
+        deck page also captures whatever has changed since last time.
+        """
+        cached = _deck_cache.get("versions")
+        if cached is not None:
+            return cached
+        try:
+            with open_store(db) as st:
+                deck_history.sync(st, _saved_decks())
+                rows = st.deck_versions()
+        except Exception as exc:  # noqa: BLE001 - history must never block
+            log.warning("deck versions unavailable: %s", exc)
+            rows = []
+        _deck_cache["versions"] = rows
+        return rows
+
+    def _version_index() -> dict[str, dict[str, Any]]:
+        """signature -> version."""
+        cached = _deck_cache.get("version_index")
+        if cached is None:
+            cached = {v["signature"]: v for v in _versions()}
+            _deck_cache["version_index"] = cached
+        return cached
+
+    def _deck_key(version: dict[str, Any]) -> str:
+        """Which deck a version belongs to, for grouping.
+
+        A version whose owning deck could not be established keeps its
+        own key rather than being folded into a deck it may not belong
+        to — the list is exact either way, only its parentage is not.
+        """
+        return version.get("deck_id") or f"orphan:{version['signature']}"
+
+    def _exact_deck_links() -> dict[str, str]:
+        """match id -> the *signature* of the list registered for it.
+
+        Only where MTGO said so. Signatures compare the maindeck alone:
+        players edit the sideboard between rounds of one league run,
+        which rewrites the file, and demanding all 75 agree would reject
+        the very games most worth attributing.
         """
         if _deck_cache.get("exact_links") is not None:
             return _deck_cache["exact_links"]
 
-        decks = _saved_decks()
-        by_main: dict[str, str] = {}
-        for d in decks:
-            key = "|".join(sorted(
-                f"{c.mtgo_id}:{c.quantity}" for c in d.maindeck
-            ))
-            # First writer wins; identical maindecks are the same deck
-            # for our purposes even under different names.
-            by_main.setdefault(key, d.deck_id)
-
+        known = _version_index()
         links: dict[str, str] = {}
         for match_id, rd in _registered_by_match().items():
-            key = "|".join(sorted(
-                f"{cid}:{qty}" for cid, qty, side in rd["cards"] if not side
-            ))
-            deck_id = by_main.get(key)
-            if deck_id:
-                links[match_id] = deck_id
+            sig = maindeck_signature(rd["cards"])
+            if sig in known:
+                links[match_id] = sig
         _deck_cache["exact_links"] = links
         return links
+
+    def _match_deck_ids() -> dict[str, str]:
+        """match id -> deck key, by way of the version that was played."""
+        cached = _deck_cache.get("match_decks")
+        if cached is not None:
+            return cached
+        index = _version_index()
+        out = {
+            mid: _deck_key(index[sig])
+            for mid, sig in _exact_deck_links().items()
+            if sig in index
+        }
+        _deck_cache["match_decks"] = out
+        return out
 
     # An MTGO constructed league entry is five matches, played in any
     # order over as long as the player likes, with no elimination — so
@@ -1547,6 +1594,53 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             "resolved_cards": resolved,
         }
 
+    def _deck_summary_cards(cards, index) -> dict[str, Any]:
+        """Colours, curve and resolution for a list of cards.
+
+        The version-aware twin of _deck_summary, which takes a parsed
+        deck file. A version we recovered has no file behind it.
+        """
+        colors: set[str] = set()
+        curve: dict[str, int] = defaultdict(int)
+        resolved = 0
+        for c in cards:
+            rec = index.get(c.mtgo_id)
+            if rec is None:
+                continue
+            resolved += 1
+            colors.update(rec.colors or "")
+            if not rec.is_land:
+                key = str(int(rec.cmc)) if rec.cmc < 7 else "7+"
+                curve[key] += c.quantity
+        ordered = sorted(colors, key=lambda ch: _WUBRG.index(ch)
+                         if ch in _WUBRG else 99)
+        return {
+            "colors": "".join(ordered),
+            "curve": dict(sorted(curve.items())),
+            "resolved_cards": resolved,
+        }
+
+    def _named_changes(raw: dict[str, list], index) -> dict[str, list]:
+        """Turn a catalog-id diff into card names the UI can print.
+
+        Without names a version list reads "+4 #112116 / -4 #52913",
+        which tells a player nothing about what they changed.
+        """
+        def name_of(cid: int) -> str:
+            rec = index.get(cid)
+            return rec.name if rec else f"#{cid}"
+
+        out: dict[str, list] = {}
+        for key, entries in raw.items():
+            merged: dict[str, int] = {}
+            for cid, qty in entries:
+                merged[name_of(cid)] = merged.get(name_of(cid), 0) + qty
+            out[key] = [
+                {"name": n, "quantity": q}
+                for n, q in sorted(merged.items(), key=lambda kv: -kv[1])
+            ]
+        return out
+
     def _deck_card_frequency(decks: list, index) -> dict[str, int]:
         """How many of the player's own decks contain each card."""
         freq: dict[str, int] = defaultdict(int)
@@ -1625,7 +1719,10 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         user = _resolve_user(user_override)
 
         matches = _all_matches(None, fmt="") if user else []
-        links = _exact_deck_links() if user else {}
+        # Keyed by deck, resolved through whichever *version* was
+        # registered — so a match played before an edit still counts
+        # toward the deck it was played with.
+        links = _match_deck_ids() if user else {}
 
         kinds = _match_event_kinds() if user else {}
 
@@ -1698,26 +1795,65 @@ def create_app(db_path: Path | None = None) -> FastAPI:
     def decklist_detail(
         deck_id: str,
         user_override: str | None = Query(None, alias="user"),
+        version: str | None = Query(
+            None, description="Signature of the version to show; latest by default"
+        ),
     ) -> dict[str, Any]:
         """One deck: the full 75, who it has faced, and when."""
         index = _card_index()
+
+        # Every version of this deck, newest first. The file on disk is
+        # only the latest of them; the rest are lists MTGO has already
+        # overwritten and we kept.
+        all_versions = [
+            v for v in _versions() if _deck_key(v) == deck_id
+        ]
         deck = next((d for d in _saved_decks() if d.deck_id == deck_id), None)
-        if deck is None:
+        if deck is None and not all_versions:
             raise HTTPException(status_code=404, detail="deck not found")
 
+        # `chosen` decides which cards are shown; `pinned` decides
+        # whether the numbers narrow with them. They differ on purpose:
+        # opening a deck shows its newest list, but a list edited an
+        # hour ago has been played zero times, and reporting "no
+        # confirmed games" for a deck with a 5-5 record would be
+        # answering a question nobody asked.
+        pinned = bool(version)
+        chosen = None
+        if version:
+            chosen = next(
+                (v for v in all_versions if v["signature"] == version), None
+            )
+            if chosen is None:
+                raise HTTPException(status_code=404, detail="version not found")
+        elif all_versions:
+            chosen = all_versions[0]
+
         def render(cards) -> list[dict[str, Any]]:
-            rows = []
+            # MTGO gives a foil printing its own catalog number, so a
+            # deck holding two foil Bilbo and one regular arrives as two
+            # rows. They are the same card to a reader, so they are
+            # merged here on the resolved card and their copies summed.
+            merged: dict[Any, Any] = {}
             for c in cards:
                 rec = index.get(c.mtgo_id)
+                key = rec.name if rec else ("unresolved", c.mtgo_id)
+                if key in merged:
+                    merged[key][1] += c.quantity
+                else:
+                    merged[key] = [c.mtgo_id, c.quantity, rec]
+
+            rows = []
+            for mtgo_id, quantity, rec in merged.values():
                 rows.append({
-                    "mtgo_id": c.mtgo_id,
-                    "quantity": c.quantity,
+                    "mtgo_id": mtgo_id,
+                    "quantity": quantity,
                     # An unresolved catalog id still appears, labelled, so
                     # the list stays a true 75 instead of silently short.
                     # These are nearly always cards from a set released
                     # in the last few weeks: MTGO has the catalog number
                     # before Scryfall publishes the mapping for it.
-                    "name": rec.name if rec else "New card #%d" % c.mtgo_id,
+                    "name": rec.name if rec else "New card #%d" % mtgo_id,
                     "mana_cost": rec.mana_cost if rec else "",
                     "type_line": rec.type_line if rec else "",
                     "cmc": rec.cmc if rec else 0.0,
@@ -1736,7 +1872,62 @@ def create_app(db_path: Path | None = None) -> FastAPI:
 
         user = _resolve_user(user_override)
         matches = _all_matches(None, fmt="") if user else []
-        links = _exact_deck_links() if user else {}
+        sig_by_match = _exact_deck_links() if user else {}
+        deck_by_match = _match_deck_ids() if user else {}
+
+        # Per-version record, so the selector can show each list's own
+        # result and the page does not have to guess which you meant.
+        per_version: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {"wins": 0, "losses": 0, "last_played": 0.0}
+        )
+        kinds_all = _match_event_kinds() if user else {}
+        for m in matches:
+            sig = sig_by_match.get(m.match_id)
+            if not sig or deck_by_match.get(m.match_id) != deck_id:
+                continue
+            if kinds_all.get(m.match_id) == CASUAL or not m.match_winner:
+                continue
+            slot = per_version[sig]
+            slot["wins" if m.match_winner == user else "losses"] += 1
+            slot["last_played"] = max(slot["last_played"], m.log_mtime or 0.0)
+
+        version_rows = []
+        for i, v in enumerate(all_versions):
+            rec = per_version.get(v["signature"])
+            w = rec["wins"] if rec else 0
+            ls = rec["losses"] if rec else 0
+            older = all_versions[i + 1] if i + 1 < len(all_versions) else None
+            version_rows.append({
+                "signature": v["signature"],
+                "changed_at": v.get("modified_at") or v["first_seen"],
+                "source": v["source"],
+                "maindeck_count": sum(c[1] for c in v["cards"] if not c[2]),
+                "sideboard_count": sum(c[1] for c in v["cards"] if c[2]),
+                "wins": w,
+                "losses": ls,
+                "matches": w + ls,
+                "winrate": (w / (w + ls)) if (w + ls) else None,
+                "last_played": (rec["last_played"] or None) if rec else None,
+                # What changed from the version before it, so the list
+                # of dates says something rather than just being dates.
+                "changes": _named_changes(
+                    deck_history.diff(older["cards"], v["cards"]), index
+                ) if older else None,
+            })
+
+        # The cards to render: the selected version, falling back to the
+        # file for a deck we have no history for yet.
+        if chosen:
+            main_cards = [
+                DeckCard(mtgo_id=c[0], quantity=c[1], sideboard=False)
+                for c in chosen["cards"] if not c[2]
+            ]
+            side_cards = [
+                DeckCard(mtgo_id=c[0], quantity=c[1], sideboard=True)
+                for c in chosen["cards"] if c[2]
+            ]
+        else:
+            main_cards, side_cards = deck.maindeck, deck.sideboard
 
         history: list[dict[str, Any]] = []
         opponents: Counter = Counter()
@@ -1746,7 +1937,11 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         kinds = _match_event_kinds() if user else {}
 
         for m in matches:
-            if links.get(m.match_id) != deck_id:
+            if deck_by_match.get(m.match_id) != deck_id:
+                continue
+            # Narrow only when a version was explicitly requested. See
+            # `pinned` above.
+            if pinned and sig_by_match.get(m.match_id) != chosen["signature"]:
                 continue
             if kinds.get(m.match_id) == CASUAL:
                 continue
@@ -1802,14 +1997,20 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         losses = sum(1 for h in history if h["result"] == "L")
 
         return {
-            "id": deck.deck_id,
-            "name": deck.name,
-            "format": deck.format,
-            "modified_at": deck.modified_at,
-            "maindeck": render(deck.maindeck),
-            "sideboard": render(deck.sideboard),
-            "maindeck_count": deck.maindeck_count,
-            "sideboard_count": deck.sideboard_count,
+            "id": deck_id,
+            "name": deck.name if deck else all_versions[0]["name"],
+            "format": deck.format if deck else all_versions[0]["format"],
+            "modified_at": (chosen.get("modified_at") if chosen else None)
+                           or (deck.modified_at if deck else 0.0),
+            "maindeck": render(main_cards),
+            "sideboard": render(side_cards),
+            "maindeck_count": sum(c.quantity for c in main_cards),
+            "sideboard_count": sum(c.quantity for c in side_cards),
+            "version": chosen["signature"] if chosen else None,
+            "versions": version_rows,
+            # False when the record covers every version of the deck,
+            # True when it covers only the list on screen.
+            "version_pinned": pinned,
             "wins": wins,
             "losses": losses,
             "winrate": (wins / (wins + losses)) if (wins + losses) else None,
@@ -1819,7 +2020,7 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             # slice the UI lists.
             "leagues": _league_runs(history),
             "distinct_opponents": len(opponents),
-            **_deck_summary(deck, index),
+            **_deck_summary_cards(main_cards, index),
         }
 
     @app.post("/api/decklists/refresh-cards")
@@ -1987,21 +2188,38 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             raise HTTPException(502, f"could not reach the server: {exc}") from exc
 
     def _push_decks() -> dict[str, Any]:
-        """Serialise saved decks and hand them to the server."""
+        """Hand every version of every deck to the server.
+
+        Versions, not just the files on disk: MTGO overwrites a deck
+        when you edit it, so uploading only what is currently saved
+        would send the website the same partial picture the app had
+        before it started keeping history — a league played on Tuesday
+        filed under Wednesday's cards, or under nothing at all.
+        """
+        def iso(ts: float | None) -> str:
+            return datetime.fromtimestamp(ts or 0, timezone.utc).isoformat()
+
         payload = []
-        for d in _saved_decks():
+        for v in _versions():
+            deck_uid = v.get("deck_id")
+            if not deck_uid:
+                # A recovered list we could not confidently place. The
+                # cards are exact, but which deck they belong to is not,
+                # and inventing a parent on the server would undo the
+                # care taken not to invent one here.
+                continue
+            changed = v.get("modified_at") or v.get("first_seen")
             payload.append({
-                "deck_uid": d.deck_id,
-                "name": d.name[:160],
-                "format": d.format[:32],
-                "signature": deck_signature(d)[:128],
-                "modified_at": datetime.fromtimestamp(
-                    d.modified_at or 0, timezone.utc
-                ).isoformat(),
-                "cards": [
-                    [c.mtgo_id, c.quantity, 1 if c.sideboard else 0]
-                    for c in d.cards
-                ],
+                "deck_uid": deck_uid[:64],
+                "name": (v["name"] or "Untitled")[:160],
+                "format": (v["format"] or "Legacy")[:32],
+                "signature": v["signature"][:128],
+                "modified_at": iso(changed),
+                "first_seen": iso(v.get("first_seen")),
+                "last_seen": iso(v.get("last_seen")),
+                "source": v.get("source") or "file",
+                "cards": [[int(c[0]), int(c[1]), int(bool(c[2]))]
+                          for c in v["cards"]],
             })
         return account.upload_decks(payload)
 

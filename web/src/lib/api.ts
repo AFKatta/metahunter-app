@@ -229,6 +229,29 @@ export type LeagueSummary = {
   abandoned_runs: number
 }
 
+/** One saved state of a deck, kept even after MTGO overwrites the file. */
+export type DeckVersion = {
+  signature: string
+  /** When this list came into being (deck file mtime, or first played). */
+  changed_at: number
+  /** "file" — read from the saved deck; "registration" — recovered. */
+  source: string
+  maindeck_count: number
+  sideboard_count: number
+  wins: number
+  losses: number
+  matches: number
+  winrate: number | null
+  last_played: number | null
+  /** What changed from the version before it. Null for the oldest. */
+  changes: {
+    maindeck_added: { name: string; quantity: number }[]
+    maindeck_removed: { name: string; quantity: number }[]
+    sideboard_added: { name: string; quantity: number }[]
+    sideboard_removed: { name: string; quantity: number }[]
+  } | null
+}
+
 export type DecklistDetail = {
   id: string
   name: string
@@ -248,6 +271,12 @@ export type DecklistDetail = {
   distinct_opponents: number
   curve: Record<string, number>
   resolved_cards: number
+  /** Signature of the version currently being shown. */
+  version: string | null
+  /** Every version of this deck, newest first. */
+  versions: DeckVersion[]
+  /** True when the record covers only the shown list, not the deck. */
+  version_pinned: boolean
 }
 
 /** The Metahunter account signed in on this machine. */
@@ -302,7 +331,7 @@ export const api = {
         refresh: r.refresh ? "true" : undefined,
       })}`
     ),
-  decklist: (id: string, r: { user?: string } = {}) =>
+  decklist: (id: string, r: { user?: string; version?: string } = {}) =>
     get<DecklistDetail>(`/api/decklists/${encodeURIComponent(id)}${qs(r)}`),
   refreshCardIndex: () =>
     postJson<{ ok: boolean; cards: number }>("/api/decklists/refresh-cards", {}),

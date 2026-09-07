@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +64,32 @@ CREATE TABLE IF NOT EXISTS registered_decks (
     captured_at   REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_regdecks_match ON registered_decks(match_uuid);
+
+-- Every distinct version of every saved deck, kept forever.
+--
+-- MTGO stores one file per deck and *overwrites* it when you edit, so
+-- the list you played last week stops existing the moment you change a
+-- card. Matches from that week then match nothing and lose their
+-- attribution — which is exactly what happened: eleven league games
+-- played on a Tuesday became unattributable on the Wednesday.
+--
+-- So each time we read the deck files we record any list we have not
+-- seen before. The file is mutable; this table is not.
+CREATE TABLE IF NOT EXISTS deck_versions (
+    signature     TEXT PRIMARY KEY,   -- sha256 of the maindeck
+    deck_id       TEXT,               -- MTGO's file uuid; NULL if recovered
+    name          TEXT NOT NULL,
+    format        TEXT NOT NULL,
+    cards_json    TEXT NOT NULL,      -- [[catalog, qty, sideboard], ...]
+    first_seen    REAL NOT NULL,      -- when this list first appeared to us
+    last_seen     REAL NOT NULL,
+    modified_at   REAL,               -- the deck file's mtime, when known
+    -- 'file'         read from the saved deck
+    -- 'registration' reconstructed from a match MTGO recorded, because
+    --                the file had already been overwritten
+    source        TEXT NOT NULL DEFAULT 'file'
+);
+CREATE INDEX IF NOT EXISTS idx_deck_versions_deck ON deck_versions(deck_id);
 
 CREATE TABLE IF NOT EXISTS matches (
     match_id      TEXT PRIMARY KEY,
@@ -281,6 +308,102 @@ class MatchStore:
             for r in self.registered_decks()
             if r["match_uuid"]
         }
+
+    # ---- deck versions -------------------------------------------------
+
+    def record_deck_version(
+        self,
+        *,
+        signature: str,
+        deck_id: str | None,
+        name: str,
+        format: str,
+        cards: list,
+        modified_at: float | None = None,
+        source: str = "file",
+        seen_at: float | None = None,
+    ) -> bool:
+        """Remember one version of a deck. Returns True if it was new.
+
+        Idempotent on the signature: re-reading an unchanged deck only
+        moves ``last_seen``. The stored cards are never rewritten — the
+        whole point is that a version, once captured, is immutable even
+        after MTGO overwrites the file it came from.
+
+        A version first recovered from a match can later be upgraded to
+        ``source='file'`` if the same list turns up on disk, and can
+        gain a ``deck_id`` and a real name that way.
+        """
+        import json as _json
+
+        now = seen_at if seen_at is not None else time.time()
+        cur = self.conn.execute(
+            "SELECT deck_id, source FROM deck_versions WHERE signature = ?",
+            (signature,),
+        ).fetchone()
+
+        if cur is None:
+            self.conn.execute(
+                "INSERT INTO deck_versions (signature, deck_id, name, format,"
+                " cards_json, first_seen, last_seen, modified_at, source)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (signature, deck_id, name, format, _json.dumps(cards),
+                 now, now, modified_at, source),
+            )
+            self.conn.commit()
+            return True
+
+        # Seen before. Refresh last_seen, and let a file reading fill in
+        # what a recovered version could not know.
+        if source == "file" and cur[1] != "file":
+            self.conn.execute(
+                "UPDATE deck_versions SET last_seen = ?, deck_id = ?,"
+                " name = ?, format = ?, modified_at = ?, source = 'file'"
+                " WHERE signature = ?",
+                (now, deck_id, name, format, modified_at, signature),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE deck_versions SET last_seen = ? WHERE signature = ?",
+                (now, signature),
+            )
+        self.conn.commit()
+        return False
+
+    def deck_versions(self, deck_id: str | None = None) -> list[dict]:
+        """Stored deck versions, newest first."""
+        import json as _json
+
+        sql = ("SELECT signature, deck_id, name, format, cards_json,"
+               " first_seen, last_seen, modified_at, source FROM deck_versions")
+        args: tuple = ()
+        if deck_id is not None:
+            sql += " WHERE deck_id = ?"
+            args = (deck_id,)
+        sql += " ORDER BY COALESCE(modified_at, first_seen) DESC"
+
+        out = []
+        for r in self.conn.execute(sql, args).fetchall():
+            out.append({
+                "signature": r[0],
+                "deck_id": r[1],
+                "name": r[2],
+                "format": r[3],
+                "cards": _json.loads(r[4]),
+                "first_seen": r[5],
+                "last_seen": r[6],
+                "modified_at": r[7],
+                "source": r[8],
+            })
+        return out
+
+    def attach_deck_version(self, signature: str, deck_id: str, name: str) -> None:
+        """Give a recovered version the deck it belongs to."""
+        self.conn.execute(
+            "UPDATE deck_versions SET deck_id = ?, name = ? WHERE signature = ?",
+            (deck_id, name, signature),
+        )
+        self.conn.commit()
 
     def fingerprint(self) -> tuple:
         """A value that changes whenever the stored data does.
