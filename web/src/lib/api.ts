@@ -252,6 +252,27 @@ export type DeckVersion = {
   } | null
 }
 
+/** How often a hand of each size was kept, and how those games went. */
+export type OpeningRow = {
+  kept: number
+  mulligans: number
+  games: number
+  share: number
+  wins: number
+  /** Null under eight decided games — a 3-1 is not a 75% keep. */
+  winrate: number | null
+}
+
+export type Openings = { games: number; by_kept: OpeningRow[] }
+
+/** One week of play. Weeks with no matches are absent, not zero. */
+export type TrendPoint = {
+  week: string
+  matches: number
+  wins: number
+  winrate: number | null
+}
+
 export type DecklistDetail = {
   id: string
   name: string
@@ -277,6 +298,16 @@ export type DecklistDetail = {
   versions: DeckVersion[]
   /** True when the record covers only the shown list, not the deck. */
   version_pinned: boolean
+  /**
+   * Mulligan depth, one entry per game.
+   *
+   * Hand size only. MTGO's log names a card once it is played or
+   * revealed and nothing is revealed before turn one, so what was in
+   * an opening hand is recorded nowhere.
+   */
+  openings: Openings
+  /** Win rate week by week, oldest first. */
+  trend: TrendPoint[]
 }
 
 /** The Metahunter account signed in on this machine. */

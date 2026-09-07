@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react"
 import { Link, useParams } from "react-router-dom"
-import { api, type DeckCard } from "@/lib/api"
+import { api, type DeckCard, type Openings, type TrendPoint } from "@/lib/api"
 import { usePersistedQuery } from "@/lib/persist"
 import { useAccount } from "@/components/AccountProvider"
 import { LeagueFinishes } from "@/components/LeagueFinishes"
@@ -306,12 +306,128 @@ export function DeckDetail() {
         <Panel title="League finishes">
           <LeagueFinishes leagues={d.leagues} />
         </Panel>
+
+        {d.openings?.games > 0 && (
+          <Panel title="Opening hands">
+            <OpeningHands openings={d.openings} />
+          </Panel>
+        )}
+
+        {d.trend?.length > 1 && (
+          <Panel title="Win rate over time">
+            <WinrateOverTime points={d.trend} />
+          </Panel>
+        )}
       </div>
     </main>
   )
 }
 
 /* ------------------------------------------------------------------ */
+
+/**
+ * Mulligan depth, and how those games went.
+ *
+ * One row per GAME rather than per match — a mulligan is a per-game
+ * decision, and a three-game match contributes three openings.
+ *
+ * Hand size only, and the note says so. MTGO's game log names a card
+ * once it is played or revealed, and nothing is revealed before turn
+ * one, so what was actually in an opening hand is recorded in no file
+ * MTGO writes. There is no "lands kept" row because there is no
+ * honest way to produce one.
+ */
+function OpeningHands({ openings }: { openings: Openings }) {
+  return (
+    <>
+      <ul className="flex flex-col gap-1">
+        {openings.by_kept.map((r) => (
+          <li key={r.kept} className="flex items-center gap-2 text-sm">
+            <span className="w-16 shrink-0">
+              {r.kept}
+              {r.mulligans > 0 && (
+                <span className="ml-1 text-[11px] text-muted-foreground">
+                  {r.mulligans === 1 ? "1 mull" : `${r.mulligans} mulls`}
+                </span>
+              )}
+            </span>
+            <span className="h-1.5 flex-1 overflow-hidden rounded-sm bg-muted">
+              <span
+                className="block h-full bg-primary/60"
+                style={{ width: `${r.share * 100}%` }}
+              />
+            </span>
+            <span className="w-12 shrink-0 text-right tabular-nums text-muted-foreground">
+              {r.games}
+            </span>
+            <span
+              className={cn(
+                "w-14 shrink-0 text-right tabular-nums",
+                r.winrate == null
+                  ? "text-muted-foreground/50"
+                  : winrateColor(r.winrate),
+              )}
+              title={
+                r.winrate == null
+                  ? "Too few games to state a win rate"
+                  : `${r.wins} of ${r.games}`
+              }
+            >
+              {r.winrate == null ? "—" : pct(r.winrate)}
+            </span>
+          </li>
+        ))}
+      </ul>
+      <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+        {openings.games} games. Hand size only — MTGO's log does not
+        record what was in a hand, so how many lands you kept is not
+        something any file can tell us.
+      </p>
+    </>
+  )
+}
+
+/**
+ * Win rate week by week.
+ *
+ * Bar height is the win rate, bar opacity how many matches that week
+ * rested on — so a 100% week off two matches reads as the thin
+ * evidence it is rather than as a peak.
+ */
+function WinrateOverTime({ points }: { points: TrendPoint[] }) {
+  const busiest = Math.max(...points.map((p) => p.matches), 1)
+  return (
+    <>
+      <div className="flex h-24 items-end gap-[3px]">
+        {points.map((p) => (
+          <div
+            key={p.week}
+            className="group relative flex-1"
+            title={`${p.week}: ${p.wins}-${p.matches - p.wins}`}
+          >
+            <div
+              className={cn(
+                "w-full rounded-sm",
+                p.winrate != null && p.winrate >= 0.5
+                  ? "bg-emerald-500"
+                  : "bg-red-500",
+              )}
+              style={{
+                height: `${Math.max((p.winrate ?? 0) * 96, 2)}px`,
+                opacity: 0.35 + 0.65 * (p.matches / busiest),
+              }}
+            />
+          </div>
+        ))}
+      </div>
+      <div className="mt-1 flex justify-between text-[11px] text-muted-foreground">
+        <span>{points[0]?.week}</span>
+        <span>50% line is the midpoint</span>
+        <span>{points[points.length - 1]?.week}</span>
+      </div>
+    </>
+  )
+}
 
 function CardGroup({
   title,

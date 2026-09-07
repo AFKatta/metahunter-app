@@ -43,6 +43,7 @@ from metahunter_core.player_index import (
     build_player_index,
     lookup_opponent_deck,
 )
+from metahunter_core.parser.game_log import OPENING_HAND_SIZE
 from metahunter_core.classifier import (
     SKIP_LABEL,
     build_card_colors,
@@ -1793,6 +1794,84 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             "excluded_friendly": len(_casual_match_ids()) if user else 0,
         }
 
+    # Games a hand size needs before its win rate is worth stating. A
+    # 3-1 is not a 75% keep, and printing it as one invents a certainty
+    # the sample does not carry.
+    MIN_OPENING_GAMES = 8
+
+    def _opening_summary(openings: list[dict[str, Any]]) -> dict[str, Any]:
+        """Mulligan depth and how those games went.
+
+        One row per game, because a mulligan is a per-game decision and
+        a three-game match contributes three openings.
+
+        Hand SIZE only. MTGO names a card in the log once it is played
+        or revealed, and nothing is revealed before turn one, so what
+        was actually in an opening hand is in no file MTGO writes.
+        There is no "lands kept" here because there is no honest way to
+        produce one.
+        """
+        if not openings:
+            return {"games": 0, "by_kept": []}
+        buckets: dict[int, dict[str, int]] = defaultdict(
+            lambda: {"games": 0, "wins": 0, "decided": 0}
+        )
+        for o in openings:
+            b = buckets[int(o["kept"])]
+            b["games"] += 1
+            if o["won"] is not None:
+                b["decided"] += 1
+                b["wins"] += 1 if o["won"] else 0
+        total = sum(b["games"] for b in buckets.values())
+        return {
+            "games": total,
+            "by_kept": [
+                {
+                    "kept": kept,
+                    "mulligans": OPENING_HAND_SIZE - kept,
+                    "games": b["games"],
+                    "share": b["games"] / total if total else 0.0,
+                    "wins": b["wins"],
+                    "winrate": (
+                        b["wins"] / b["decided"]
+                        if b["decided"] >= MIN_OPENING_GAMES else None
+                    ),
+                }
+                for kept, b in sorted(buckets.items(), reverse=True)
+            ],
+        }
+
+    def _weekly_trend(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Win rate week by week, oldest first.
+
+        Weeks with no play are absent rather than drawn as zero: a week
+        you did not play is not a week you lost every game.
+        """
+        weeks: dict[str, dict[str, int]] = defaultdict(
+            lambda: {"matches": 0, "wins": 0}
+        )
+        for h in history:
+            if not h.get("result") or not h.get("played_at"):
+                continue
+            # Monday of the week the match was played, so buckets line
+            # up with how leagues are actually run.
+            t = time.localtime(h["played_at"])
+            monday = time.mktime(
+                (t.tm_year, t.tm_mon, t.tm_mday - t.tm_wday, 0, 0, 0, 0, 0, -1)
+            )
+            key = time.strftime("%Y-%m-%d", time.localtime(monday))
+            weeks[key]["matches"] += 1
+            weeks[key]["wins"] += 1 if h["result"] == "W" else 0
+        return [
+            {
+                "week": week,
+                "matches": v["matches"],
+                "wins": v["wins"],
+                "winrate": v["wins"] / v["matches"] if v["matches"] else None,
+            }
+            for week, v in sorted(weeks.items())
+        ]
+
     @app.get("/api/decklists/{deck_id}")
     def decklist_detail(
         deck_id: str,
@@ -1932,6 +2011,8 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             main_cards, side_cards = deck.maindeck, deck.sideboard
 
         history: list[dict[str, Any]] = []
+        # Mulligan depth, one entry per GAME rather than per match.
+        openings: list[dict[str, Any]] = []
         opponents: Counter = Counter()
         vs: dict[str, dict[str, int]] = defaultdict(
             lambda: {"wins": 0, "losses": 0}
@@ -1978,6 +2059,15 @@ def create_app(db_path: Path | None = None) -> FastAPI:
                 # match is absent entirely.
                 "event_kind": kinds.get(m.match_id, "unknown"),
             })
+            for g in m.games:
+                for hand in g.get("opening_hands") or []:
+                    if hand.get("player") != user:
+                        continue
+                    winner = g.get("winner")
+                    openings.append({
+                        "kept": int(hand.get("kept", 0)),
+                        "won": (winner == user) if winner else None,
+                    })
 
         history.sort(key=lambda r: r["played_at"] or 0, reverse=True)
         matchups = sorted(
@@ -2000,6 +2090,8 @@ def create_app(db_path: Path | None = None) -> FastAPI:
 
         return {
             "id": deck_id,
+            "openings": _opening_summary(openings),
+            "trend": _weekly_trend(history),
             "name": deck.name if deck else all_versions[0]["name"],
             "format": deck.format if deck else all_versions[0]["format"],
             "modified_at": (chosen.get("modified_at") if chosen else None)

@@ -42,6 +42,7 @@ from .state import hash_username, load_or_create_state
 
 log = logging.getLogger(__name__)
 
+META_KEY_UPLOADED_PARSER = "uploaded_parser_version"
 META_KEY_LAST_UPLOADED = "last_uploaded_log_mtime"
 DEFAULT_INTERVAL_SECONDS = 5 * 60
 BATCH_SIZE = 100
@@ -58,6 +59,28 @@ def _signature_for(registered, match_id):
         return maindeck_signature(row["cards"])[:128]
     except Exception:  # noqa: BLE001 - a malformed row is not fatal
         return None
+
+
+def _openings_for(games: list[dict], player: str) -> list[dict]:
+    """How this player opened each game, in order.
+
+    ``games`` is the stored per-game record. Matches parsed before the
+    opening lines were read have nothing here and produce an empty
+    list — which the server stores as "not parsed", never as "never
+    mulliganed". Those two have to stay tellable apart.
+    """
+    out: list[dict] = []
+    for g in games:
+        for hand in g.get("opening_hands") or []:
+            if hand.get("player") != player:
+                continue
+            winner = g.get("winner")
+            out.append({
+                "kept": int(hand.get("kept", 0)),
+                # None when the log recorded no outcome for that game.
+                "won": (winner == player) if winner else None,
+            })
+    return out
 
 
 class Uploader:
@@ -132,6 +155,26 @@ class Uploader:
             except ValueError:
                 parser_version = 0
 
+            # When the parser learns to read something new, everything
+            # already uploaded is missing it. The watermark is by log
+            # time and would never revisit those, so a parser bump
+            # resets it once: every match goes up again carrying the
+            # new field, and the server upserts them in place.
+            #
+            # This is how opening hands reached matches played before
+            # the parser could see them.
+            try:
+                sent_version = int(store.get_meta(META_KEY_UPLOADED_PARSER, "0") or 0)
+            except ValueError:
+                sent_version = 0
+            resend_all = sent_version < parser_version
+            if resend_all:
+                log.info(
+                    "uploader: parser %s -> %s, re-sending every match once",
+                    sent_version, parser_version,
+                )
+                rows = list(store.iter_matches())
+
             # Matches we now know the registered deck for, even if they
             # were uploaded before we knew it. The watermark only moves
             # forward, so without this an older match could never gain
@@ -140,7 +183,7 @@ class Uploader:
             # (MTGO's log reaches back days, not months) and re-sending
             # is idempotent, so this is cheap insurance.
             known = set(store.registered_by_match())
-            if known:
+            if known and not resend_all:
                 seen = {m.match_id for m in rows}
                 rows = list(rows) + [
                     m for m in store.iter_matches()
@@ -214,6 +257,11 @@ class Uploader:
                 store.set_meta(
                     META_KEY_LAST_UPLOADED, str(max(max_seen_mtime, since))
                 )
+                if resend_all:
+                    # Only after a clean sweep. A partial re-send that
+                    # recorded the version would leave the rest of the
+                    # archive missing the new field forever.
+                    store.set_meta(META_KEY_UPLOADED_PARSER, str(parser_version))
         return {"sent": sent, "new": new, "merged": merged, "errors": errors}
 
     def _sync_decks(self) -> None:
@@ -287,6 +335,7 @@ class Uploader:
                 "games_won": sum(1 for g in m.games if g.get("winner") == user),
                 "cards_observed": you_cards,
                 "cards_cast": you_cast,
+                "openings": _openings_for(m.games, user),
             },
             "opponent": {
                 "username_hash": hash_username(install_salt, opp),
@@ -296,6 +345,7 @@ class Uploader:
                 "games_won": sum(1 for g in m.games if g.get("winner") == opp),
                 "cards_observed": opp_cards,
                 "cards_cast": opp_cast,
+                "openings": _openings_for(m.games, opp),
             },
             "client_version": CLIENT_VERSION,
             "parser_version": parser_version,
