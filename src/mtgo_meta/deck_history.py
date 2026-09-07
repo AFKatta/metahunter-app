@@ -201,6 +201,50 @@ def sync(store, decks) -> dict[str, int]:
     return {"new": new, "recovered": recovered}
 
 
+def upload_payload(versions: list[dict]) -> list[dict[str, Any]]:
+    """Serialise deck versions for the server.
+
+    Shared by the manual "upload decks" button and the background
+    uploader so the two cannot disagree about what a deck upload is.
+
+    Versions with no established owning deck are left out: their cards
+    are exact, but which deck they belong to is not, and inventing a
+    parent on the server would undo the care taken not to invent one
+    here.
+    """
+    from datetime import datetime, timezone
+
+    def iso(ts: float | None) -> str:
+        return datetime.fromtimestamp(ts or 0, timezone.utc).isoformat()
+
+    out: list[dict[str, Any]] = []
+    for v in versions:
+        deck_uid = v.get("deck_id")
+        if not deck_uid:
+            continue
+        changed = v.get("modified_at") or v.get("first_seen")
+        out.append({
+            "deck_uid": str(deck_uid)[:64],
+            "name": (v.get("name") or "Untitled")[:160],
+            "format": (v.get("format") or "Legacy")[:32],
+            "signature": v["signature"][:128],
+            "modified_at": iso(changed),
+            "first_seen": iso(v.get("first_seen")),
+            "last_seen": iso(v.get("last_seen")),
+            "source": v.get("source") or "file",
+            "cards": [[int(c[0]), int(c[1]), int(bool(c[2]))] for c in v["cards"]],
+        })
+    return out
+
+
+def payload_fingerprint(payload: list[dict[str, Any]]) -> str:
+    """Identity of a deck payload, for skipping unchanged uploads."""
+    import hashlib
+
+    key = "|".join(sorted(f"{d['deck_uid']}:{d['signature']}" for d in payload))
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
 def group_versions(versions: list[dict]) -> dict[str, list[dict]]:
     """Versions grouped into decks, newest version first within each.
 

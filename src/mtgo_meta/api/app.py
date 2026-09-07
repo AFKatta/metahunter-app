@@ -122,11 +122,6 @@ FORMAT_DATA = format_data_dir()
 DEFAULT_DB = default_db_path()
 WEB_DIST = web_dist_dir()
 
-# Overriding an archetype similarity already named takes stronger
-# agreement from a published decklist than filling in a blank one
-# does. Players change decks between events, so a marginally
-# consistent old list replacing a good inference is a regression.
-PUBLISHED_OVERRIDE_CONSISTENCY = 0.75
 
 SIGNATURE_NOISE = {
     "Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes",
@@ -298,17 +293,24 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         if not player:
             return similar
 
-        # How much agreement a published list needs depends on what we
-        # would otherwise say. With nothing usable — too few cards, or a
-        # bare colour code — any consistent list is an improvement. To
-        # override an archetype we already named, demand more: players
-        # switch decks, and a marginal old list replacing a good
-        # inference would be a regression, not a fix.
-        weak = similar == SKIP_LABEL or _is_colour_code(similar)
-        threshold = MIN_CONSISTENCY if weak else PUBLISHED_OVERRIDE_CONSISTENCY
+        # A published decklist is consulted only when the cards in front
+        # of us say nothing usable — too few of them, or a bare colour
+        # code. It never overrules a real archetype.
+        #
+        # It used to, at 75% agreement, and that was a clear regression:
+        # two decks in the same colours share lands and staples, so 75%
+        # is easy to reach between lists that are nothing alike. It
+        # relabelled a Naya Initiative deck "Mystic Forge Combo", and a
+        # Dimir Tempo deck "Dimir Delver" when no Delver was ever cast,
+        # purely because those players had published something else
+        # within the last six weeks. What somebody registered a month
+        # ago is not evidence about the deck they are playing now; the
+        # cards on the battlefield are.
+        if not (similar == SKIP_LABEL or _is_colour_code(similar)):
+            return similar
 
         known = _published_lookup_cached(
-            cards_key, fmt, player.lower(), threshold
+            cards_key, fmt, player.lower(), MIN_CONSISTENCY
         )
         return known or similar
 
@@ -2188,40 +2190,8 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             raise HTTPException(502, f"could not reach the server: {exc}") from exc
 
     def _push_decks() -> dict[str, Any]:
-        """Hand every version of every deck to the server.
-
-        Versions, not just the files on disk: MTGO overwrites a deck
-        when you edit it, so uploading only what is currently saved
-        would send the website the same partial picture the app had
-        before it started keeping history — a league played on Tuesday
-        filed under Wednesday's cards, or under nothing at all.
-        """
-        def iso(ts: float | None) -> str:
-            return datetime.fromtimestamp(ts or 0, timezone.utc).isoformat()
-
-        payload = []
-        for v in _versions():
-            deck_uid = v.get("deck_id")
-            if not deck_uid:
-                # A recovered list we could not confidently place. The
-                # cards are exact, but which deck they belong to is not,
-                # and inventing a parent on the server would undo the
-                # care taken not to invent one here.
-                continue
-            changed = v.get("modified_at") or v.get("first_seen")
-            payload.append({
-                "deck_uid": deck_uid[:64],
-                "name": (v["name"] or "Untitled")[:160],
-                "format": (v["format"] or "Legacy")[:32],
-                "signature": v["signature"][:128],
-                "modified_at": iso(changed),
-                "first_seen": iso(v.get("first_seen")),
-                "last_seen": iso(v.get("last_seen")),
-                "source": v.get("source") or "file",
-                "cards": [[int(c[0]), int(c[1]), int(bool(c[2]))]
-                          for c in v["cards"]],
-            })
-        return account.upload_decks(payload)
+        """Hand every version of every deck to the server."""
+        return account.upload_decks(deck_history.upload_payload(_versions()))
 
     # router owns every non-/api route, so we serve index.html as the
     # fallback for anything not found in /assets/.

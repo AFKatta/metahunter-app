@@ -25,13 +25,16 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from metahunter_core.deck_files import maindeck_signature
+from metahunter_core.deck_files import load_decks, maindeck_signature
 from metahunter_core.classifier import (
     build_card_colors, build_card_weights, classify_by_similarity,
     recompute_deck_color_identity,
 )
 from mtgo_meta.paths import corpus_path, default_db_path
 from mtgo_meta.store import open_store
+
+from mtgo_meta import account as account_mod
+from mtgo_meta import deck_history
 
 from . import consent as consent_mod
 from .client import CLIENT_VERSION, UploadClient
@@ -80,6 +83,9 @@ class Uploader:
         # Lazy-loaded corpus — built on the first sweep so app startup
         # isn't blocked.
         self._corpus_loaded = False
+        # Fingerprint of the deck payload we last uploaded, so a
+        # sweep with no deck changes sends nothing.
+        self._decks_sent: str | None = None
         self._decks: list[dict] = []
         self._weights: dict = {}
         self._card_colors: dict = {}
@@ -198,6 +204,8 @@ class Uploader:
                 flush()
         flush()
 
+        self._sync_decks()
+
         if sent > 0 and errors == 0:
             with open_store(default_db_path()) as store:
                 # max(), because the batch may now include older matches
@@ -207,6 +215,36 @@ class Uploader:
                     META_KEY_LAST_UPLOADED, str(max(max_seen_mtime, since))
                 )
         return {"sent": sent, "new": new, "merged": merged, "errors": errors}
+
+    def _sync_decks(self) -> None:
+        """Push saved decks, and their history, on the regular sweep.
+
+        Decks used to upload exactly once — right after an MTGO account
+        was claimed — so any deck built afterwards never reached the
+        website at all. The list is small and the server upserts by
+        signature, so re-sending an unchanged set is harmless; the
+        fingerprint check just avoids the request entirely.
+        """
+        if not account_mod.load().signed_in:
+            return
+        try:
+            with open_store(default_db_path()) as store:
+                deck_history.sync(store, load_decks(constructed_only=True))
+                versions = store.deck_versions()
+            payload = deck_history.upload_payload(versions)
+            if not payload:
+                return
+            fingerprint = deck_history.payload_fingerprint(payload)
+            if fingerprint == self._decks_sent:
+                return
+            result = account_mod.upload_decks(payload)
+            self._decks_sent = fingerprint
+            log.info(
+                "uploader: decks synced (%s stored, %s removed)",
+                result.get("stored"), result.get("removed"),
+            )
+        except Exception as exc:  # noqa: BLE001 - never break the match sweep
+            log.info("uploader: deck sync skipped (%s)", exc)
 
     def _build_payload(self, m, user, install_salt, parser_version,
                        registered=None):
