@@ -225,16 +225,50 @@ export type LeagueSummary = {
   } | null
   average_wins: number | null
   league_matches: number
-  /** Entries that stopped short of five matches and are not scored. */
-  abandoned_runs: number
+  /** Entries that ended short of five matches, dropped or left. */
+  dropped_runs: number
+  /** Every entry, newest first, with the matches it was built from. */
+  entries: LeagueEntry[]
 }
 
-/** One saved state of a deck, kept even after MTGO overwrites the file. */
+export type LeagueEntryMatch = {
+  match_id: string
+  played_at: number | null
+  result: "W" | "L" | null
+  score: string | null
+  opponent_archetype: string | null
+  /** The player marked this as the match the entry ended on. */
+  marked: boolean
+}
+
+export type LeagueEntry = {
+  status: "complete" | "dropped" | "unfinished" | "in_progress"
+  /** five_matches, marked, list_changed, gap — or null while open. */
+  ended_by: string | null
+  wins: number
+  losses: number
+  matches: number
+  started_at: number | null
+  ended_at: number | null
+  played: LeagueEntryMatch[]
+}
+
+/**
+ * A list this deck was played with, or the one saved in MTGO now.
+ *
+ * Lists saved and never played are not here: MTGO rewrites the deck
+ * file on every click in the editor, and those states are forgotten.
+ * Compared by card name, so a printing swap is not a new list.
+ */
 export type DeckVersion = {
+  /** Identity of the 75 by card name. */
   signature: string
-  /** When this list came into being (deck file mtime, or first played). */
+  /** The list saved in MTGO right now. */
+  current: boolean
+  /** When this list first saw play; for an unplayed current list, its save time. */
   changed_at: number
-  /** "file" — read from the saved deck; "registration" — recovered. */
+  first_played: number | null
+  /** "played" or "current" (current and not played yet). */
   source: string
   maindeck_count: number
   sideboard_count: number
@@ -296,6 +330,8 @@ export type DecklistDetail = {
   version: string | null
   /** Every version of this deck, newest first. */
   versions: DeckVersion[]
+  /** The list saved in MTGO now, when the deck still exists. */
+  current_version: string | null
   /** True when the record covers only the shown list, not the deck. */
   version_pinned: boolean
   /**
@@ -364,6 +400,12 @@ export const api = {
     ),
   decklist: (id: string, r: { user?: string; version?: string } = {}) =>
     get<DecklistDetail>(`/api/decklists/${encodeURIComponent(id)}${qs(r)}`),
+  /** End a league entry on this match (or undo that). MTGO records no drops. */
+  markLeagueEntry: (matchId: string, ended: boolean) =>
+    postJson<{ ok: boolean }>("/api/decklists/league-mark", {
+      match_id: matchId,
+      ended,
+    }),
   refreshCardIndex: () =>
     postJson<{ ok: boolean; cards: number }>("/api/decklists/refresh-cards", {}),
   health: () => get<{ ok: boolean; corpus_decks: number; archetypes: number }>("/api/health"),

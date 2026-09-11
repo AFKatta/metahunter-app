@@ -141,15 +141,44 @@ class _TextLogPoller(threading.Thread):
             try:
                 store = MatchStore(conn)
                 result = deck_history.sync(store, decks)
-                if result.get("new") or result.get("recovered"):
+                if result.get("new") or result.get("recovered") or result.get("forgotten"):
                     print(
                         f"  decks: {result['new']} new list(s), "
-                        f"{result['recovered']} recovered"
+                        f"{result['recovered']} recovered, "
+                        f"{result.get('forgotten', 0)} never-played forgotten"
                     )
             finally:
                 conn.close()
         except Exception as e:  # noqa: BLE001 - never block the poller
             print(f"  decks: {e}", file=sys.stderr)
+
+    @staticmethod
+    def _store_league_messages(store, facts) -> int:
+        """Keep MTGO's league lines, with a real date attached.
+
+        A log line carries only a clock time. It is dated by when it is
+        read: the log is rewritten every MTGO session, so a line is from
+        today — unless its time is later than now, which means a session
+        that ran past midnight, and so yesterday.
+        """
+        import hashlib
+        from datetime import datetime, timedelta
+
+        now = datetime.now()
+        rows = []
+        for msg in getattr(facts, "league_messages", []):
+            try:
+                hh, mm, ss = (int(x) for x in msg.time.split(":"))
+                at = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+            except ValueError:
+                continue
+            if at > now + timedelta(minutes=1):
+                at -= timedelta(days=1)
+            key = hashlib.sha1(
+                f"{msg.path}|{msg.offset}|{msg.time}|{msg.detail}".encode("utf-8")
+            ).hexdigest()
+            rows.append((key, at.timestamp(), msg.kind, msg.detail))
+        return store.record_league_messages(rows) if rows else 0
 
     def run(self) -> None:
         # A first pass on startup picks up anything written while the
@@ -184,13 +213,16 @@ class _TextLogPoller(threading.Thread):
         facts = None
         for p in changed:
             facts = parse_text_log(p, facts)
-        if facts is None or not facts.decks_by_game:
+        if facts is None:
             return
 
         stored = 0
         conn = sqlite3.connect(self.db_path)
         try:
             store = MatchStore(conn)
+            # League lines can arrive in a session with no registration
+            # in it, so they are kept before anything can return early.
+            self._store_league_messages(store, facts)
             for game_id, rd in facts.decks_by_game.items():
                 match_uuid = facts.match_by_game.get(game_id)
                 store.upsert_registered_deck(

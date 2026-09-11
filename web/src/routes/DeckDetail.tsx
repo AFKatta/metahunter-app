@@ -68,6 +68,19 @@ export function DeckDetail() {
     staleTime: 30_000,
   })
 
+  // A drop mark changes how every later entry is grouped, so the deck is
+  // re-read afterwards rather than patched in place.
+  const [marking, setMarking] = useState<string | null>(null)
+  const markEntry = async (matchId: string, ended: boolean) => {
+    setMarking(matchId)
+    try {
+      await api.markLeagueEntry(matchId, ended)
+      await q.refetch()
+    } finally {
+      setMarking(null)
+    }
+  }
+
   const groups = useMemo(() => {
     const main = q.data?.maindeck ?? []
     const spells = SPELL_TYPES.map((t) => ({
@@ -128,10 +141,10 @@ export function DeckDetail() {
               {d.versions.length > 1 && (
                 <>
                   {" · "}
-                  <span title="This deck has been edited; you are seeing one of its lists.">
-                    {d.versions.findIndex((v) => v.signature === d.version) === 0
-                      ? "latest list"
-                      : "an earlier list"}{" "}
+                  <span title="Lists you played, and the one saved in MTGO now. Saves you never played are not kept.">
+                    {d.version === d.current_version
+                      ? "current list"
+                      : "a list you played"}{" "}
                     of {d.versions.length}
                   </span>
                 </>
@@ -304,7 +317,11 @@ export function DeckDetail() {
         </Panel>
 
         <Panel title="League finishes">
-          <LeagueFinishes leagues={d.leagues} />
+          <LeagueFinishes
+            leagues={d.leagues}
+            onMark={markEntry}
+            marking={marking}
+          />
         </Panel>
 
         {d.openings?.games > 0 && (

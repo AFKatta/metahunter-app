@@ -1,4 +1,4 @@
-"""Remember every version of every deck, because MTGO does not.
+"""Remember every version of every deck that was played, because MTGO does not.
 
 MTGO keeps one file per deck and overwrites it in place when you edit.
 The list you registered for a league on Tuesday simply stops existing on
@@ -6,17 +6,23 @@ Wednesday, so the matches you played with it match nothing and lose
 their attribution. That is not hypothetical — eleven league games did
 exactly that, and the deck page showed a single run instead of two.
 
-So this module does two things:
+So this module does three things:
 
 * **Snapshot.** Every time the saved decks are read, any list we have
-  not seen before is written to ``deck_versions`` and never changed
-  again. The file is mutable; the record is not.
+  not seen before is written to ``deck_versions``. The file is mutable;
+  the record is not.
 
 * **Recover.** For matches MTGO already told us about, we hold the exact
   registered decklist. Where that list matches no version we know, it is
   a version we missed — usually one that existed before this feature, or
   before the app was installed. It gets stored, and attached to the deck
   it most resembles.
+
+* **Forget.** MTGO rewrites the file on every click in the deck editor,
+  so snapshotting alone kept every intermediate state: one evening of
+  tuning a deck left seventeen versions of it, most of them 57- or
+  62-card lists nobody could have registered. A version is kept only if
+  a match was played with it, or if it is the list saved right now.
 
 Recovery is the one inferential step here and it is bounded: the *list*
 is exact, taken from MTGO's own record. The only guess is which named
@@ -27,11 +33,13 @@ entirely" is not a plausible reading.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from metahunter_core.deck_files import maindeck_signature
+from metahunter_core.event_kind import CASUAL, resolve as resolve_event_kind
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +48,13 @@ log = logging.getLogger(__name__)
 # normally well above 0.9; two genuinely different decks in a format
 # share lands and staples and land far below this.
 SAME_DECK_OVERLAP = 0.70
+
+# How long a list that was never played is kept once the deck file has
+# moved past it. Long enough that a match started with it has certainly
+# had its registration read from MTGO's log — the poller looks every
+# fifteen seconds — and short enough that an evening of edits does not
+# linger.
+FORGET_AFTER_SECONDS = 30 * 60
 
 
 def _maindeck_counts(cards: Iterable) -> dict[int, int]:
@@ -104,6 +119,118 @@ def diff(previous: Iterable, current: Iterable) -> dict[str, list]:
         "sideboard_removed": sr,
     }
 
+
+# ---------------------------------------------------------------------------
+# Lists by card name
+# ---------------------------------------------------------------------------
+
+def list_by_name(
+    cards: Iterable, name_of: Callable[[int], str]
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Maindeck and sideboard as ``{card name: copies}``.
+
+    MTGO gives every printing its own catalog number, so the same list
+    re-saved with a foil Force of Will reads as four cards out and four
+    in. That happened: two "versions" shown twenty-one cards apart were
+    the same seventy-five, differing only in which printings MTGO had
+    picked. By name they are identical, which is what they are.
+    """
+    main: dict[str, int] = {}
+    side: dict[str, int] = {}
+    for cid, qty, is_side in cards:
+        bucket = side if is_side else main
+        name = name_of(int(cid))
+        bucket[name] = bucket.get(name, 0) + int(qty)
+    return main, side
+
+
+def name_fingerprint(cards: Iterable, name_of: Callable[[int], str]) -> str:
+    """Identity of a full 75 by card name, ignoring printings.
+
+    The sideboard is included: a player who swaps two sideboard cards
+    between leagues has registered a different list, and the record of
+    each belongs to each.
+    """
+    main, side = list_by_name(cards, name_of)
+    key = (
+        "M|" + "|".join(f"{n}:{q}" for n, q in sorted(main.items()))
+        + "#S|" + "|".join(f"{n}:{q}" for n, q in sorted(side.items()))
+    )
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def name_diff(
+    older: Iterable, newer: Iterable, name_of: Callable[[int], str]
+) -> dict[str, list[dict[str, Any]]]:
+    """What changed between two lists, by card name, per zone."""
+    om, osb = list_by_name(older, name_of)
+    nm, nsb = list_by_name(newer, name_of)
+
+    def delta(before: dict[str, int], after: dict[str, int]):
+        added, removed = [], []
+        for name in sorted(set(before) | set(after)):
+            d = after.get(name, 0) - before.get(name, 0)
+            if d > 0:
+                added.append({"name": name, "quantity": d})
+            elif d < 0:
+                removed.append({"name": name, "quantity": -d})
+        added.sort(key=lambda x: -x["quantity"])
+        removed.sort(key=lambda x: -x["quantity"])
+        return added, removed
+
+    ma, mr = delta(om, nm)
+    sa, sr = delta(osb, nsb)
+    return {
+        "maindeck_added": ma,
+        "maindeck_removed": mr,
+        "sideboard_added": sa,
+        "sideboard_removed": sr,
+    }
+
+
+# ---------------------------------------------------------------------------
+# What was played
+# ---------------------------------------------------------------------------
+
+def current_signatures(decks) -> set[str]:
+    """Signatures of the lists saved in MTGO right now."""
+    return {
+        maindeck_signature((c.mtgo_id, c.quantity, c.sideboard) for c in d.cards)
+        for d in decks
+    }
+
+
+def registered_signatures(registrations, *, counted_only: bool = False) -> set[str]:
+    """Signatures MTGO recorded as registered for a match.
+
+    ``counted_only`` leaves out lists registered only for friendly games.
+    Friendly games never count toward anything, so a list only ever
+    played in one is, for everything the player sees, unplayed.
+    """
+    out: set[str] = set()
+    for r in registrations:
+        cards = r.get("cards") or []
+        if not cards:
+            continue
+        if counted_only and resolve_event_kind(
+            text_log_kind=r.get("event_kind"), league_flag=r.get("is_league"),
+        ) == CASUAL:
+            continue
+        out.add(maindeck_signature(cards))
+    return out
+
+
+def upload_keep(registrations, decks) -> set[str]:
+    """Versions worth sending to the website: played for real, or current."""
+    return (
+        registered_signatures(registrations, counted_only=True)
+        | current_signatures(decks)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Snapshot, recover, forget
+# ---------------------------------------------------------------------------
 
 def snapshot_decks(store, decks) -> int:
     """Record any saved deck whose list we have not seen. Returns new count."""
@@ -193,19 +320,68 @@ def recover_from_registrations(store) -> int:
     return recovered
 
 
+def forget_unplayed(store, decks, *, now: float | None = None) -> int:
+    """Delete lists that were saved but never played. Returns how many.
+
+    Kept: every list MTGO recorded as registered for any match, and every
+    list saved in MTGO right now. Everything else is an editing state.
+
+    Two guards. Nothing is forgotten when no deck files were read at all,
+    because an unreadable folder must not look like every deck having
+    been deleted. And a list is kept for a while after the file moves
+    past it, so a match started with it has time to be seen first.
+
+    A list registered only for friendly games is kept here and hidden
+    from the player elsewhere: hiding is reversible, deleting is not.
+    """
+    if not decks:
+        return 0
+    now = time.time() if now is None else now
+    try:
+        keep = current_signatures(decks) | registered_signatures(
+            store.registered_decks()
+        )
+        doomed = [
+            v["signature"] for v in store.deck_versions()
+            if v["signature"] not in keep
+            and (v.get("last_seen") or 0) < now - FORGET_AFTER_SECONDS
+        ]
+        if not doomed:
+            return 0
+        gone = store.forget_deck_versions(doomed)
+        log.info("deck_history: forgot %d never-played list(s)", gone)
+        return gone
+    except Exception as exc:  # noqa: BLE001 - history is never fatal
+        log.warning("deck_history: could not forget old lists: %s", exc)
+        return 0
+
+
 def sync(store, decks) -> dict[str, int]:
-    """Snapshot the current files, then recover anything missing."""
+    """Snapshot the current files, recover anything missing, forget the rest."""
     new = snapshot_decks(store, decks)
-    # Recovery runs second so it can compare against everything on disk.
+    # Recovery runs before forgetting, so a list that turns out to have
+    # been played is known before anything decides it was not.
     recovered = recover_from_registrations(store)
-    return {"new": new, "recovered": recovered}
+    forgotten = forget_unplayed(store, decks)
+    return {"new": new, "recovered": recovered, "forgotten": forgotten}
 
 
-def upload_payload(versions: list[dict]) -> list[dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Upload
+# ---------------------------------------------------------------------------
+
+def upload_payload(
+    versions: list[dict], keep: set[str] | None = None
+) -> list[dict[str, Any]]:
     """Serialise deck versions for the server.
 
     Shared by the manual "upload decks" button and the background
     uploader so the two cannot disagree about what a deck upload is.
+
+    ``keep`` limits the upload to those signatures — in practice
+    ``upload_keep``: lists played for real, and the one saved now. The
+    server deletes whatever a deck upload leaves out, so this is also
+    how never-played saves leave the website.
 
     Versions with no established owning deck are left out: their cards
     are exact, but which deck they belong to is not, and inventing a
@@ -221,6 +397,8 @@ def upload_payload(versions: list[dict]) -> list[dict[str, Any]]:
     for v in versions:
         deck_uid = v.get("deck_id")
         if not deck_uid:
+            continue
+        if keep is not None and v["signature"] not in keep:
             continue
         changed = v.get("modified_at") or v.get("first_seen")
         out.append({
@@ -239,8 +417,6 @@ def upload_payload(versions: list[dict]) -> list[dict[str, Any]]:
 
 def payload_fingerprint(payload: list[dict[str, Any]]) -> str:
     """Identity of a deck payload, for skipping unchanged uploads."""
-    import hashlib
-
     key = "|".join(sorted(f"{d['deck_uid']}:{d['signature']}" for d in payload))
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 

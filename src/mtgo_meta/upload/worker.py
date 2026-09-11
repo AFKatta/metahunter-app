@@ -276,10 +276,19 @@ class Uploader:
         if not account_mod.load().signed_in:
             return
         try:
+            decks = load_decks(constructed_only=True)
+            if not decks:
+                # An unreadable deck folder must not upload an empty set:
+                # the server would take it as every deck being deleted.
+                return
             with open_store(default_db_path()) as store:
-                deck_history.sync(store, load_decks(constructed_only=True))
+                deck_history.sync(store, decks)
                 versions = store.deck_versions()
-            payload = deck_history.upload_payload(versions)
+                keep = deck_history.upload_keep(store.registered_decks(), decks)
+            # Only lists that were played, or the one saved now. The
+            # server deletes whatever a deck upload leaves out, so a
+            # never-played save disappears from the website as well.
+            payload = deck_history.upload_payload(versions, keep=keep)
             if not payload:
                 return
             fingerprint = deck_history.payload_fingerprint(payload)

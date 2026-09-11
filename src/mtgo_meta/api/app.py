@@ -20,7 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -66,6 +66,7 @@ from mtgo_meta.paths import (
 )
 from mtgo_meta.store import open_store
 from mtgo_meta import account, deck_history, net
+from mtgo_meta.leagues import league_runs
 from mtgo_meta.upload.client import server_url as upload_server_url
 
 log = logging.getLogger(__name__)
@@ -1465,105 +1466,6 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         _deck_cache["match_decks"] = out
         return out
 
-    # An MTGO constructed league entry is five matches, played in any
-    # order over as long as the player likes, with no elimination — so
-    # every record from 5-0 down to 0-5 is reachable.
-    LEAGUE_RUN_LENGTH = 5
-
-    # A league entry is played out over days, not weeks. A longer silence
-    # than this between two league matches on one deck is a new entry,
-    # not the same one resumed — see _league_runs.
-    LEAGUE_RUN_GAP_SECONDS = 10 * 24 * 3600
-
-    def _league_runs(history: list[dict[str, Any]]) -> dict[str, Any]:
-        """Split a deck's league matches into entries and score each one.
-
-        MTGO never writes league standings to any file we can read — only
-        the client's *requests* for them appear in the log — so an entry
-        has to be rebuilt from its matches. Two rules do it:
-
-        * A gap of more than ten days starts a new entry. Without this a
-          run from October and a run from December would be welded into
-          one imaginary 5-0.
-        * Within a stretch of play, matches go five to an entry in the
-          order they happened. MTGO does not let one deck hold two
-          concurrent entries in the same league, so the sequence is
-          unambiguous as long as no match is missing.
-
-        A group of fewer than five is a run still open (or abandoned) and
-        is never scored: calling a 2-1 an "0-5" would be far worse than
-        saying nothing.
-        """
-        played = sorted(
-            (h for h in history
-             if h.get("event_kind") == LEAGUE and h.get("result")),
-            key=lambda h: h["played_at"] or 0.0,
-        )
-
-        # Break the timeline at long silences first, then take five at a
-        # time inside each stretch.
-        stretches: list[list[dict[str, Any]]] = []
-        for h in played:
-            at = h["played_at"] or 0.0
-            if stretches and at - (stretches[-1][-1]["played_at"] or 0.0) \
-                    <= LEAGUE_RUN_GAP_SECONDS:
-                stretches[-1].append(h)
-            else:
-                stretches.append([h])
-
-        finishes: Counter = Counter()
-        open_runs: list[dict[str, Any]] = []
-        last_chunk_is_open = False
-
-        for stretch in stretches:
-            for i in range(0, len(stretch), LEAGUE_RUN_LENGTH):
-                chunk = stretch[i:i + LEAGUE_RUN_LENGTH]
-                wins = sum(1 for h in chunk if h["result"] == "W")
-                losses = len(chunk) - wins
-                complete = len(chunk) == LEAGUE_RUN_LENGTH
-                if complete:
-                    finishes["%d-%d" % (wins, losses)] += 1
-                else:
-                    open_runs.append({
-                        "wins": wins,
-                        "losses": losses,
-                        "matches": len(chunk),
-                        "started_at": chunk[0]["played_at"],
-                    })
-                last_chunk_is_open = not complete
-
-        # An open run only counts as "in progress" when it is the most
-        # recent league activity on the deck. An unfinished run followed
-        # by a later, complete one was abandoned, and showing it as live
-        # would have the deck permanently mid-league.
-        in_progress = open_runs[-1] if (open_runs and last_chunk_is_open) else None
-        abandoned = len(open_runs) - (1 if in_progress else 0)
-
-        # Every rung of the ladder is returned, zeroes included, so the
-        # UI can draw a stable set of bars instead of a shifting subset.
-        ladder = [
-            {"record": "%d-%d" % (w, LEAGUE_RUN_LENGTH - w),
-             "wins": w,
-             "runs": finishes.get("%d-%d" % (w, LEAGUE_RUN_LENGTH - w), 0)}
-            for w in range(LEAGUE_RUN_LENGTH, -1, -1)
-        ]
-        completed = sum(r["runs"] for r in ladder)
-        return {
-            "ladder": ladder,
-            "completed_runs": completed,
-            "trophies": finishes.get("5-0", 0),
-            "in_progress": in_progress,
-            # Match wins across completed runs only, so the average is
-            # comparable between decks.
-            "average_wins": (
-                sum(r["wins"] * r["runs"] for r in ladder) / completed
-            ) if completed else None,
-            "league_matches": len(played),
-            # Runs that never reached five matches. Surfaced so the sum
-            # of the ladder is not silently short of the match count.
-            "abandoned_runs": abandoned,
-        }
-
     _WUBRG = "WUBRG"
 
     def _deck_summary(deck, index) -> dict[str, Any]:
@@ -1883,9 +1785,8 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         """One deck: the full 75, who it has faced, and when."""
         index = _card_index()
 
-        # Every version of this deck, newest first. The file on disk is
-        # only the latest of them; the rest are lists MTGO has already
-        # overwritten and we kept.
+        # Stored versions are only used to find the deck here. Which lists
+        # are shown is decided below, from what was actually played.
         all_versions = [
             v for v in _versions() if _deck_key(v) == deck_id
         ]
@@ -1893,22 +1794,9 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         if deck is None and not all_versions:
             raise HTTPException(status_code=404, detail="deck not found")
 
-        # `chosen` decides which cards are shown; `pinned` decides
-        # whether the numbers narrow with them. They differ on purpose:
-        # opening a deck shows its newest list, but a list edited an
-        # hour ago has been played zero times, and reporting "no
-        # confirmed games" for a deck with a 5-5 record would be
-        # answering a question nobody asked.
-        pinned = bool(version)
-        chosen = None
-        if version:
-            chosen = next(
-                (v for v in all_versions if v["signature"] == version), None
-            )
-            if chosen is None:
-                raise HTTPException(status_code=404, detail="version not found")
-        elif all_versions:
-            chosen = all_versions[0]
+        def name_of(cid: int) -> str:
+            rec = index.get(int(cid))
+            return rec.name if rec else f"#{int(cid)}"
 
         def render(cards) -> list[dict[str, Any]]:
             # MTGO gives a foil printing its own catalog number, so a
@@ -1953,62 +1841,131 @@ def create_app(db_path: Path | None = None) -> FastAPI:
 
         user = _resolve_user(user_override)
         matches = _all_matches(None, fmt="") if user else []
-        sig_by_match = _exact_deck_links() if user else {}
         deck_by_match = _match_deck_ids() if user else {}
-
-        # Per-version record, so the selector can show each list's own
-        # result and the page does not have to guess which you meant.
-        per_version: dict[str, dict[str, Any]] = defaultdict(
-            lambda: {"wins": 0, "losses": 0, "last_played": 0.0}
-        )
+        registered = _registered_by_match() if user else {}
         kinds_all = _match_event_kinds() if user else {}
+
+        # The lists this deck was actually played with.
+        #
+        # Built from MTGO's registrations, not from the saved versions.
+        # The deck file is rewritten on every click in the editor, so the
+        # saved versions are mostly states nobody played — seventeen for
+        # one deck, two of them played. And a registration is the exact 75
+        # that was used, sideboard included, where a saved version keeps
+        # whichever sideboard the file had when that maindeck first
+        # appeared.
+        #
+        # Grouped by card name: MTGO numbers every printing separately, and
+        # a list re-saved with foil copies is the same list. Two versions
+        # once showed twenty-one cards apart that were identical.
+        played: dict[str, dict[str, Any]] = {}
+        list_key_by_match: dict[str, str] = {}
         for m in matches:
-            sig = sig_by_match.get(m.match_id)
-            if not sig or deck_by_match.get(m.match_id) != deck_id:
+            if deck_by_match.get(m.match_id) != deck_id:
                 continue
             if kinds_all.get(m.match_id) == CASUAL or not m.match_winner:
                 continue
-            slot = per_version[sig]
+            reg = registered.get(m.match_id)
+            if not reg or not reg.get("cards"):
+                continue
+            key = deck_history.name_fingerprint(reg["cards"], name_of)
+            list_key_by_match[m.match_id] = key
+            at = m.log_mtime or 0.0
+            slot = played.get(key)
+            if slot is None:
+                slot = played[key] = {
+                    "key": key, "cards": reg["cards"], "wins": 0, "losses": 0,
+                    "first_played": at, "last_played": at,
+                }
             slot["wins" if m.match_winner == user else "losses"] += 1
-            slot["last_played"] = max(slot["last_played"], m.log_mtime or 0.0)
+            slot["first_played"] = min(slot["first_played"], at)
+            if at >= slot["last_played"]:
+                slot["last_played"] = at
+                slot["cards"] = reg["cards"]
 
+        # The list saved in MTGO right now, exactly as the file has it.
+        current_key = None
+        if deck is not None:
+            current_cards = [
+                [c.mtgo_id, c.quantity, 1 if c.sideboard else 0] for c in deck.cards
+            ]
+            current_key = deck_history.name_fingerprint(current_cards, name_of)
+            if current_key in played:
+                played[current_key]["cards"] = current_cards
+            else:
+                played[current_key] = {
+                    "key": current_key, "cards": current_cards, "wins": 0,
+                    "losses": 0, "first_played": None, "last_played": None,
+                }
+
+        # Oldest first, so each list's changes are against the one before
+        # it. A current list nobody has played yet is the newest of all.
+        chronological = sorted(
+            played.values(),
+            key=lambda x: (x["first_played"] is None, x["first_played"] or 0.0),
+        )
         version_rows = []
-        for i, v in enumerate(all_versions):
-            rec = per_version.get(v["signature"])
-            w = rec["wins"] if rec else 0
-            ls = rec["losses"] if rec else 0
-            older = all_versions[i + 1] if i + 1 < len(all_versions) else None
+        previous = None
+        for item in chronological:
+            w, ls = item["wins"], item["losses"]
             version_rows.append({
-                "signature": v["signature"],
-                "changed_at": v.get("modified_at") or v["first_seen"],
-                "source": v["source"],
-                "maindeck_count": sum(c[1] for c in v["cards"] if not c[2]),
-                "sideboard_count": sum(c[1] for c in v["cards"] if c[2]),
+                "signature": item["key"],
+                "current": item["key"] == current_key,
+                # When this list first saw play; for a current list nobody
+                # has played yet, when the file was saved.
+                "changed_at": item["first_played"]
+                if item["first_played"] is not None
+                else (deck.modified_at if deck else 0.0),
+                "first_played": item["first_played"],
+                "last_played": item["last_played"],
+                "source": "played" if (w + ls) else "current",
+                "maindeck_count": sum(int(c[1]) for c in item["cards"] if not c[2]),
+                "sideboard_count": sum(int(c[1]) for c in item["cards"] if c[2]),
                 "wins": w,
                 "losses": ls,
                 "matches": w + ls,
                 "winrate": (w / (w + ls)) if (w + ls) else None,
-                "last_played": (rec["last_played"] or None) if rec else None,
-                # What changed from the version before it, so the list
-                # of dates says something rather than just being dates.
-                "changes": _named_changes(
-                    deck_history.diff(older["cards"], v["cards"]), index
-                ) if older else None,
+                "changes": deck_history.name_diff(
+                    previous["cards"], item["cards"], name_of
+                ) if previous else None,
             })
+            previous = item
+        # Current first, then by when each list was last played.
+        version_rows.sort(
+            key=lambda r: (not r["current"], -(r["last_played"] or 0.0))
+        )
 
-        # The cards to render: the selected version, falling back to the
-        # file for a deck we have no history for yet.
-        if chosen:
-            main_cards = [
-                DeckCard(mtgo_id=c[0], quantity=c[1], sideboard=False)
-                for c in chosen["cards"] if not c[2]
-            ]
-            side_cards = [
-                DeckCard(mtgo_id=c[0], quantity=c[1], sideboard=True)
-                for c in chosen["cards"] if c[2]
-            ]
+        # `chosen` decides which cards are shown; `pinned` decides whether
+        # the numbers narrow with them. Opening a deck shows the list saved
+        # now, with the whole deck's record: a list edited an hour ago has
+        # no games, and "no confirmed games" for a deck that has played
+        # twenty would answer a question nobody asked. A version that no
+        # longer exists — a stale selection — falls back rather than
+        # breaking the page.
+        pinned = bool(version) and version in played
+        if pinned:
+            chosen = played[version]
+        elif current_key is not None:
+            chosen = played[current_key]
+        elif played:
+            chosen = max(played.values(), key=lambda x: x["last_played"] or 0.0)
         else:
-            main_cards, side_cards = deck.maindeck, deck.sideboard
+            chosen = None
+
+        if chosen is not None:
+            shown_cards = chosen["cards"]
+        elif all_versions:
+            shown_cards = all_versions[0]["cards"]
+        else:
+            shown_cards = []
+        main_cards = [
+            DeckCard(mtgo_id=int(c[0]), quantity=int(c[1]), sideboard=False)
+            for c in shown_cards if not c[2]
+        ]
+        side_cards = [
+            DeckCard(mtgo_id=int(c[0]), quantity=int(c[1]), sideboard=True)
+            for c in shown_cards if c[2]
+        ]
 
         history: list[dict[str, Any]] = []
         # Mulligan depth, one entry per GAME rather than per match.
@@ -2024,7 +1981,7 @@ def create_app(db_path: Path | None = None) -> FastAPI:
                 continue
             # Narrow only when a version was explicitly requested. See
             # `pinned` above.
-            if pinned and sig_by_match.get(m.match_id) != chosen["signature"]:
+            if pinned and list_key_by_match.get(m.match_id) != chosen["key"]:
                 continue
             if kinds.get(m.match_id) == CASUAL:
                 continue
@@ -2085,6 +2042,12 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             key=lambda r: -r["matches"],
         )
 
+        try:
+            with open_store(db) as st:
+                marks = st.league_marks()
+        except Exception:  # noqa: BLE001 - a missing mark table must not break the page
+            marks = set()
+
         wins = sum(1 for h in history if h["result"] == "W")
         losses = sum(1 for h in history if h["result"] == "L")
 
@@ -2094,13 +2057,15 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             "trend": _weekly_trend(history),
             "name": deck.name if deck else all_versions[0]["name"],
             "format": deck.format if deck else all_versions[0]["format"],
-            "modified_at": (chosen.get("modified_at") if chosen else None)
-                           or (deck.modified_at if deck else 0.0),
+            "modified_at": deck.modified_at if deck
+                           else ((chosen or {}).get("last_played") or 0.0),
             "maindeck": render(main_cards),
             "sideboard": render(side_cards),
             "maindeck_count": sum(c.quantity for c in main_cards),
             "sideboard_count": sum(c.quantity for c in side_cards),
-            "version": chosen["signature"] if chosen else None,
+            "version": chosen["key"] if chosen else None,
+            # The list saved in MTGO now, when the deck still exists.
+            "current_version": current_key,
             "versions": version_rows,
             # False when the record covers every version of the deck,
             # True when it covers only the list on screen.
@@ -2112,10 +2077,29 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             "history": history[:100],
             # Runs are scored over the full history, not the truncated
             # slice the UI lists.
-            "leagues": _league_runs(history),
+            "leagues": league_runs(
+                history, marks=marks, list_keys=list_key_by_match
+            ),
             "distinct_opponents": len(opponents),
             **_deck_summary_cards(main_cards, index),
         }
+
+    @app.post("/api/decklists/league-mark")
+    def mark_league_entry(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        """Say a league entry ended on this match, or take that back.
+
+        MTGO records no drop in any file the app can read, so without this
+        a dropped entry is indistinguishable from one still running and
+        every entry after it is grouped wrong. The mark stays on this
+        machine.
+        """
+        match_id = str(payload.get("match_id") or "").strip()
+        if not match_id:
+            raise HTTPException(status_code=400, detail="match_id is required")
+        ended = bool(payload.get("ended", True))
+        with open_store(db) as st:
+            st.set_league_mark(match_id, ended)
+        return {"ok": True, "match_id": match_id, "ended": ended}
 
     @app.post("/api/decklists/refresh-cards")
     def refresh_card_index() -> dict[str, Any]:
@@ -2282,8 +2266,21 @@ def create_app(db_path: Path | None = None) -> FastAPI:
             raise HTTPException(502, f"could not reach the server: {exc}") from exc
 
     def _push_decks() -> dict[str, Any]:
-        """Hand every version of every deck to the server."""
-        return account.upload_decks(deck_history.upload_payload(_versions()))
+        """Hand the server the lists worth keeping: played, or current.
+
+        The server deletes whatever a deck upload leaves out, so this is
+        also how never-played saves leave the website.
+        """
+        decks = _saved_decks(force=True)
+        if not decks:
+            # An unreadable deck folder must not read as every deck deleted.
+            return {"stored": 0, "removed": 0}
+        versions = _versions()
+        with open_store(db) as st:
+            keep = deck_history.upload_keep(st.registered_decks(), decks)
+        return account.upload_decks(
+            deck_history.upload_payload(versions, keep=keep)
+        )
 
     # router owns every non-/api route, so we serve index.html as the
     # fallback for anything not found in /assets/.

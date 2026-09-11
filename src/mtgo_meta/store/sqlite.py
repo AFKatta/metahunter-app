@@ -91,6 +91,31 @@ CREATE TABLE IF NOT EXISTS deck_versions (
 );
 CREATE INDEX IF NOT EXISTS idx_deck_versions_deck ON deck_versions(deck_id);
 
+-- Where the player says a league entry ended early.
+--
+-- MTGO writes no drop anywhere this app can read: the game log has no
+-- event, the history file's Round is 0 for every league match, and the
+-- text log is rewritten each session. So a drop is recorded when the
+-- player marks it, against the last match of the entry they left.
+CREATE TABLE IF NOT EXISTS league_marks (
+    match_id      TEXT PRIMARY KEY,
+    marked_at     REAL NOT NULL
+);
+
+-- League lines from MTGO's client log, kept as written.
+--
+-- Nothing reads these to decide anything yet. They exist so that the
+-- first league join or drop made with the app running shows what MTGO
+-- actually logs for it, instead of a guess.
+CREATE TABLE IF NOT EXISTS league_messages (
+    key           TEXT PRIMARY KEY,   -- file, offset and text, hashed
+    at            REAL NOT NULL,      -- when it happened, dated on capture
+    kind          TEXT NOT NULL,      -- send / handler / panel
+    detail        TEXT,
+    captured_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_league_messages_at ON league_messages(at);
+
 CREATE TABLE IF NOT EXISTS matches (
     match_id      TEXT PRIMARY KEY,
     log_path      TEXT NOT NULL,
@@ -404,6 +429,65 @@ class MatchStore:
             (deck_id, name, signature),
         )
         self.conn.commit()
+
+    def forget_deck_versions(self, signatures) -> int:
+        """Delete stored versions by signature. Returns how many went.
+
+        Only for lists that were saved and never played — see
+        ``deck_history.forget_unplayed``, which decides what qualifies.
+        """
+        sigs = [s for s in signatures if s]
+        removed = 0
+        for i in range(0, len(sigs), 500):
+            chunk = sigs[i:i + 500]
+            cur = self.conn.execute(
+                "DELETE FROM deck_versions WHERE signature IN (%s)"
+                % ",".join("?" * len(chunk)),
+                chunk,
+            )
+            removed += cur.rowcount
+        if sigs:
+            self.conn.commit()
+        return removed
+
+    # ---- league entries ------------------------------------------------
+
+    def league_marks(self) -> set[str]:
+        """Matches the player marked as the last of a league entry."""
+        return {r[0] for r in self.conn.execute("SELECT match_id FROM league_marks")}
+
+    def set_league_mark(self, match_id: str, ended: bool) -> None:
+        """Mark, or unmark, a match as the one an entry ended on."""
+        if ended:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO league_marks (match_id, marked_at)"
+                " VALUES (?, ?)",
+                (match_id, time.time()),
+            )
+        else:
+            self.conn.execute(
+                "DELETE FROM league_marks WHERE match_id = ?", (match_id,)
+            )
+        self.conn.commit()
+
+    def record_league_messages(self, rows) -> int:
+        """Keep league lines from the client log. Returns how many were new.
+
+        ``rows`` is ``(key, at, kind, detail)``. The log is re-read whole
+        whenever it grows, so the same lines arrive again and again; the
+        key makes that free.
+        """
+        now = time.time()
+        added = 0
+        for key, at, kind, detail in rows:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO league_messages"
+                " (key, at, kind, detail, captured_at) VALUES (?, ?, ?, ?, ?)",
+                (key, at, kind, detail, now),
+            )
+            added += cur.rowcount
+        self.conn.commit()
+        return added
 
     def fingerprint(self) -> tuple:
         """A value that changes whenever the stored data does.
