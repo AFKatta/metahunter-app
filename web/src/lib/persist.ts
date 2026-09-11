@@ -22,10 +22,20 @@ const PREFIX = "mh.cache."
 /**
  * Bumped when a cached payload's shape or meaning changes; old entries
  * are dropped rather than shown. 3: deck colours are taken from mana
- * costs instead of Scryfall colour identity, so a cached deck would
- * briefly show the old, wrong pips before the refresh landed.
+ * costs instead of Scryfall colour identity. 4: deck pages gained league
+ * entries and played lists in 0.7.1 — and not bumping this for that
+ * release is what turned every deck page black: the page painted 0.7.0's
+ * saved copy first, which had no entries to list.
  */
-const VERSION = 3
+const VERSION = 4
+
+/**
+ * The build that wrote an entry. A response saved by one release is never
+ * shown by another, whether or not anybody remembered to bump VERSION.
+ * Forgetting to is exactly how the black deck page shipped, so it should
+ * not be something a release depends on remembering.
+ */
+const BUILD = __APP_BUILD__
 
 /**
  * Entries larger than this are not written. Deck detail payloads carry
@@ -37,7 +47,7 @@ const MAX_BYTES = 512 * 1024
 /** Anything older than this is treated as absent rather than shown. */
 const MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000
 
-type Envelope<T> = { v: number; at: number; data: T }
+type Envelope<T> = { v: number; b: string; at: number; data: T }
 
 function storageKey(key: unknown[]): string {
   return PREFIX + JSON.stringify(key)
@@ -53,7 +63,15 @@ function read<T>(key: unknown[]): Envelope<T> | null {
   if (!raw) return null
   try {
     const env = JSON.parse(raw) as Envelope<T>
-    if (env.v !== VERSION) return null
+    if (env.v !== VERSION || env.b !== BUILD) {
+      // From another build: never shown, so not worth the storage either.
+      try {
+        window.localStorage.removeItem(storageKey(key))
+      } catch {
+        /* nothing to do */
+      }
+      return null
+    }
     if (!env.at || Date.now() - env.at > MAX_AGE_MS) return null
     return env
   } catch {
@@ -64,7 +82,7 @@ function read<T>(key: unknown[]): Envelope<T> | null {
 function write<T>(key: unknown[], data: T, at: number): void {
   let raw: string
   try {
-    raw = JSON.stringify({ v: VERSION, at, data } satisfies Envelope<T>)
+    raw = JSON.stringify({ v: VERSION, b: BUILD, at, data } satisfies Envelope<T>)
   } catch {
     return // non-serialisable payload; nothing worth caching
   }

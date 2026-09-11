@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query"
-import { Route, Routes } from "react-router-dom"
+import { Route, Routes, useLocation } from "react-router-dom"
 import { Header } from "@/components/Header"
 import { ConsentDialog } from "@/components/ConsentDialog"
 import { UpdateBanner } from "@/components/UpdateBanner"
@@ -12,6 +12,7 @@ import { MatchDetail } from "@/routes/MatchDetail"
 import { Settings } from "@/routes/Settings"
 import { SignIn } from "@/routes/SignIn"
 import { api } from "@/lib/api"
+import { ErrorBoundary } from "@/components/ErrorBoundary"
 
 function App() {
   // Block every route until consent is recorded. Cached forever
@@ -33,6 +34,9 @@ function App() {
     refetchInterval: false,
   })
 
+  // Keys the error boundary: leaving a page that failed recovers the app.
+  const location = useLocation()
+
   // While the state is loading, hold off rendering anything — a brief
   // blank screen is better than flashing the dashboard to a not-yet-
   // consented user.
@@ -52,6 +56,7 @@ function App() {
       <UpdateBanner />
       <Header />
       <main>
+        <ErrorBoundary key={location.pathname}>
         <Routes>
           <Route path="/" element={<Overview />} />
           <Route path="/decks" element={<Decks />} />
@@ -69,6 +74,7 @@ function App() {
             }
           />
         </Routes>
+        </ErrorBoundary>
       </main>
       {needsConsent && <ConsentDialog />}
     </div>
