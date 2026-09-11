@@ -74,12 +74,23 @@ try {
 Write-Host ""
 Write-Host "==> 2/4  Cleaning previous build"
 
-# Kill any Metahunter.exe lingering from a previous smoke-test. If we
-# don't, the running process holds its DLLs open and Windows refuses
-# to delete the dist folder (WinError 5 / "Access is denied").
-$running = Get-Process -Name "Metahunter" -ErrorAction SilentlyContinue
-if ($running) {
-    Write-Host "  Stopping $($running.Count) running Metahunter process(es)..."
+# Stop a Metahunter.exe left running from THIS build's own output — a
+# smoke test of dist\Metahunter — or it holds its DLLs open and Windows
+# refuses to delete the folder (WinError 5 / "Access is denied").
+#
+# Only processes whose executable sits inside this repo's build or dist
+# folders. Matching on the name alone also killed the player's installed
+# Metahunter every time a release was built.
+$ownDirs = @("build", "dist") | ForEach-Object { (Join-Path $PSScriptRoot $_) + "\" }
+$running = @(Get-Process -Name "Metahunter" -ErrorAction SilentlyContinue |
+    Where-Object {
+        $exe = $_.Path
+        $exe -and ($ownDirs | Where-Object {
+            $exe.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+    })
+if ($running.Count -gt 0) {
+    Write-Host "  Stopping $($running.Count) Metahunter process(es) running from this build..."
     $running | Stop-Process -Force
     Start-Sleep -Milliseconds 500
 }
