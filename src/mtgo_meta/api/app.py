@@ -66,6 +66,7 @@ from mtgo_meta.paths import (
 )
 from mtgo_meta.store import open_store
 from mtgo_meta import account, deck_history, net
+from mtgo_meta.event_kinds import casual_match_ids, event_kinds
 from mtgo_meta.leagues import league_runs
 from mtgo_meta.upload.client import server_url as upload_server_url
 
@@ -522,37 +523,8 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         cached = _deck_cache.get("casual_ids")
         if cached is not None:
             return cached
-
-        import bisect
-
-        import metahunter_core.parser.game_history as _gh
-
-        recs: list[tuple[float, str]] = []
-        try:
-            for h in mtgo_history_files():
-                p = _gh._Parser(h.read_bytes())
-                try:
-                    p.parse()
-                except Exception:  # noqa: BLE001
-                    pass
-                recs += p.matches
-        except Exception:  # noqa: BLE001
-            recs = []
-        recs.sort()
-        starts = [r[0] for r in recs]
-
-        def blurb_for(mtime: float | None) -> str | None:
-            if mtime is None or not recs:
-                return None
-            k = bisect.bisect_left(starts, mtime)
-            best, best_delta = None, 7200.0
-            for x in (k - 1, k, k + 1):
-                if 0 <= x < len(recs):
-                    delta = abs(recs[x][0] - mtime)
-                    if delta < best_delta:
-                        best, best_delta = recs[x][1], delta
-            return best
-
+        # Reads the store directly rather than through _all_matches,
+        # which filters on this very set.
         try:
             with open_store(db) as st:
                 registered = st.registered_by_match()
@@ -560,17 +532,7 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         except Exception:  # noqa: BLE001
             _deck_cache["casual_ids"] = set()
             return set()
-
-        out: set[str] = set()
-        for m in rows:
-            rd = registered.get(m.match_id) or {}
-            kind = resolve_event_kind(
-                text_log_kind=rd.get("event_kind"),
-                league_flag=rd.get("is_league"),
-                description=blurb_for(getattr(m, "log_mtime", None)),
-            )
-            if kind == CASUAL:
-                out.add(m.match_id)
+        out = casual_match_ids(registered, rows)
         _deck_cache["casual_ids"] = out
         return out
 
@@ -1332,55 +1294,12 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         cached = _deck_cache.get("event_kinds")
         if cached is not None:
             return cached
-
-        import bisect
-
-        import metahunter_core.parser.game_history as _gh
-
-        # Event blurbs, by match start time.
-        recs: list[tuple[float, str]] = []
-        try:
-            for h in mtgo_history_files():
-                p = _gh._Parser(h.read_bytes())
-                try:
-                    p.parse()
-                except Exception:  # noqa: BLE001
-                    pass
-                recs += p.matches
-        except Exception:  # noqa: BLE001
-            recs = []
-        recs.sort()
-        starts = [r[0] for r in recs]
-
-        def blurb_for(mtime: float | None) -> str | None:
-            # The log's mtime lands within a couple of hours of the
-            # match start, so the nearest record inside that window is
-            # the right one.
-            if mtime is None or not recs:
-                return None
-            k = bisect.bisect_left(starts, mtime)
-            best, best_delta = None, 7200.0
-            for x in (k - 1, k, k + 1):
-                if 0 <= x < len(recs):
-                    delta = abs(recs[x][0] - mtime)
-                    if delta < best_delta:
-                        best, best_delta = recs[x][1], delta
-            return best
-
         try:
             with open_store(db) as st:
                 registered = st.registered_by_match()
         except Exception:  # noqa: BLE001
             registered = {}
-
-        out: dict[str, str] = {}
-        for m in _all_matches(None, fmt=""):
-            rd = registered.get(m.match_id) or {}
-            out[m.match_id] = resolve_event_kind(
-                text_log_kind=rd.get("event_kind"),
-                league_flag=rd.get("is_league"),
-                description=blurb_for(getattr(m, "log_mtime", None)),
-            )
+        out = event_kinds(registered, _all_matches(None, fmt=""))
         _deck_cache["event_kinds"] = out
         return out
 

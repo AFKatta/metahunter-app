@@ -35,6 +35,7 @@ from mtgo_meta.store import open_store
 
 from mtgo_meta import account as account_mod
 from mtgo_meta import deck_history
+from mtgo_meta.event_kinds import event_kinds
 
 from . import consent as consent_mod
 from .client import CLIENT_VERSION, UploadClient
@@ -43,6 +44,12 @@ from .state import hash_username, load_or_create_state
 log = logging.getLogger(__name__)
 
 META_KEY_UPLOADED_PARSER = "uploaded_parser_version"
+META_KEY_UPLOADED_PAYLOAD = "uploaded_payload_version"
+
+# Bumped when the payload gains a field that matters for matches already
+# uploaded. 2: the event kind. Without it the server had no way to tell
+# a league round from a game against a friend, and counted both.
+PAYLOAD_VERSION = 2
 META_KEY_LAST_UPLOADED = "last_uploaded_log_mtime"
 DEFAULT_INTERVAL_SECONDS = 5 * 60
 BATCH_SIZE = 100
@@ -167,7 +174,11 @@ class Uploader:
                 sent_version = int(store.get_meta(META_KEY_UPLOADED_PARSER, "0") or 0)
             except ValueError:
                 sent_version = 0
-            resend_all = sent_version < parser_version
+            try:
+                sent_payload = int(store.get_meta(META_KEY_UPLOADED_PAYLOAD, "0") or 0)
+            except ValueError:
+                sent_payload = 0
+            resend_all = sent_version < parser_version or sent_payload < PAYLOAD_VERSION
             if resend_all:
                 log.info(
                     "uploader: parser %s -> %s, re-sending every match once",
@@ -215,6 +226,15 @@ class Uploader:
         except Exception:  # noqa: BLE001 - attribution is a bonus, not a gate
             registered = {}
 
+        # What kind of event each match was. A friendly game must never
+        # reach a public number, and the server cannot tell on its own:
+        # MTGO records this in a log it rotates, so only the client that
+        # was running at the time can say.
+        try:
+            kinds = event_kinds(registered, rows)
+        except Exception:  # noqa: BLE001 - never block an upload on this
+            kinds = {}
+
         # Build payloads.
         batch: list[dict] = []
         sent = new = merged = errors = 0
@@ -237,7 +257,7 @@ class Uploader:
 
         for m in rows:
             payload = self._build_payload(
-                m, user, install_salt, parser_version, registered,
+                m, user, install_salt, parser_version, registered, kinds,
             )
             if payload is None:
                 continue
@@ -262,6 +282,7 @@ class Uploader:
                     # recorded the version would leave the rest of the
                     # archive missing the new field forever.
                     store.set_meta(META_KEY_UPLOADED_PARSER, str(parser_version))
+                    store.set_meta(META_KEY_UPLOADED_PAYLOAD, str(PAYLOAD_VERSION))
         return {"sent": sent, "new": new, "merged": merged, "errors": errors}
 
     def _sync_decks(self) -> None:
@@ -304,7 +325,7 @@ class Uploader:
             log.info("uploader: deck sync skipped (%s)", exc)
 
     def _build_payload(self, m, user, install_salt, parser_version,
-                       registered=None):
+                       registered=None, kinds=None):
         if user not in m.players:
             return None
         opp = next((p for p in m.players if p != user), None)
@@ -356,6 +377,10 @@ class Uploader:
                 "cards_cast": opp_cast,
                 "openings": _openings_for(m.games, opp),
             },
+            # "league" / "tournament" / "casual", or None where MTGO
+            # never said. None is not casual and the server treats it
+            # as such: only a positive casual is left out of figures.
+            "event_kind": (kinds or {}).get(m.match_id),
             "client_version": CLIENT_VERSION,
             "parser_version": parser_version,
         }
